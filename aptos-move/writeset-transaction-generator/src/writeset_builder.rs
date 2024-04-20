@@ -4,28 +4,25 @@
 
 use anyhow::format_err;
 use aptos_crypto::HashValue;
-use aptos_gas::{
-    AbstractValueSizeGasParameters, ChangeSetConfigs, NativeGasParameters,
-    LATEST_GAS_FEATURE_VERSION,
-};
-use aptos_state_view::StateView;
+use aptos_gas_schedule::{MiscGasParameters, NativeGasParameters, LATEST_GAS_FEATURE_VERSION};
 use aptos_types::{
     account_address::AccountAddress,
     account_config::{self, aptos_test_root_address},
-    on_chain_config::{Features, TimedFeatures},
+    on_chain_config::{Features, TimedFeaturesBuilder},
+    state_store::StateView,
     transaction::{ChangeSet, Script, Version},
 };
 use aptos_vm::{
-    data_cache::StorageAdapter,
+    data_cache::AsMoveResolver,
     move_vm_ext::{MoveVmExt, SessionExt, SessionId},
 };
+use aptos_vm_types::storage::change_set_configs::ChangeSetConfigs;
 use move_core_types::{
     identifier::Identifier,
     language_storage::{ModuleId, TypeTag},
     transaction_argument::convert_txn_args,
     value::{serialize_values, MoveValue},
 };
-use move_vm_runtime::session::SerializedReturnValues;
 use move_vm_types::gas::UnmeteredGasMeter;
 
 pub struct GenesisSession<'r, 'l>(SessionExt<'r, 'l>);
@@ -59,11 +56,7 @@ impl<'r, 'l> GenesisSession<'r, 'l> {
             });
     }
 
-    pub fn exec_script(
-        &mut self,
-        sender: AccountAddress,
-        script: &Script,
-    ) -> SerializedReturnValues {
+    pub fn exec_script(&mut self, sender: AccountAddress, script: &Script) {
         let mut temp = vec![sender.to_vec()];
         temp.extend(convert_txn_args(script.args()));
         self.0
@@ -111,40 +104,38 @@ pub fn build_changeset<S: StateView, F>(state_view: &S, procedure: F, chain_id: 
 where
     F: FnOnce(&mut GenesisSession),
 {
+    let resolver = state_view.as_move_resolver();
     let move_vm = MoveVmExt::new(
         NativeGasParameters::zeros(),
-        AbstractValueSizeGasParameters::zeros(),
+        MiscGasParameters::zeros(),
         LATEST_GAS_FEATURE_VERSION,
         chain_id,
         Features::default(),
-        TimedFeatures::enable_all(),
+        TimedFeaturesBuilder::enable_all().build(),
+        &resolver,
+        false,
     )
     .unwrap();
-    let state_view_storage = StorageAdapter::new(state_view);
     let change_set = {
         // TODO: specify an id by human and pass that in.
         let genesis_id = HashValue::zero();
-        let mut session = GenesisSession(move_vm.new_session(
-            &state_view_storage,
-            SessionId::genesis(genesis_id),
-            true,
-        ));
+        let mut session =
+            GenesisSession(move_vm.new_session(&resolver, SessionId::genesis(genesis_id)));
         session.disable_reconfiguration();
         procedure(&mut session);
         session.enable_reconfiguration();
         session
             .0
-            .finish(
-                &mut (),
-                &ChangeSetConfigs::unlimited_at_gas_feature_version(LATEST_GAS_FEATURE_VERSION),
-            )
+            .finish(&ChangeSetConfigs::unlimited_at_gas_feature_version(
+                LATEST_GAS_FEATURE_VERSION,
+            ))
             .map_err(|err| format_err!("Unexpected VM Error: {:?}", err))
             .unwrap()
     };
 
     // Genesis never produces the delta change set.
-    assert!(change_set.delta_change_set().is_empty());
-
-    let (write_set, _delta_change_set, events) = change_set.unpack();
-    ChangeSet::new(write_set, events)
+    assert!(change_set.aggregator_v1_delta_set().is_empty());
+    change_set
+        .try_into_storage_change_set()
+        .expect("Conversion from VMChangeSet into ChangeSet should always succeed")
 }

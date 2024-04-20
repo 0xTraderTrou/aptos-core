@@ -2,17 +2,15 @@
 /// * Listing rate, the units charged for creating a listing.
 /// * Bidding rate, the units per bid made by a potential buyer.
 /// * Commission, the units transferred to the marketplace upon sale.
-///
-/// Note: this is ony a schedule, a higher layer needs to implement the type of asset class
-/// and the transferring of that asset for each scheduled event.
 module marketplace::fee_schedule {
     use std::error;
     use std::signer;
     use std::string::{Self, String};
+    use aptos_std::math64;
 
     use aptos_std::type_info;
 
-    use aptos_framework::event::{Self, EventHandle};
+    use aptos_framework::event;
     use aptos_framework::object::{Self, ConstructorRef, ExtendRef, Object};
 
     /// FeeSchedule does not exist.
@@ -31,8 +29,6 @@ module marketplace::fee_schedule {
         fee_address: address,
         /// Ref for changing the configuration of the marketplace
         extend_ref: ExtendRef,
-        /// An event stream of changes to the fee schedule
-        mutation_events: EventHandle<MutationEvent>,
     }
 
     #[resource_group_member(group = aptos_framework::object::ObjectGroup)]
@@ -65,8 +61,10 @@ module marketplace::fee_schedule {
         numerator: u64,
     }
 
+    #[event]
     /// Event representing a change to the marketplace configuration
-    struct MutationEvent has drop, store {
+    struct Mutation has drop, store {
+        marketplace: address,
         /// The type info of the struct that was updated.
         updated_resource: String,
     }
@@ -74,7 +72,7 @@ module marketplace::fee_schedule {
     // Initializers
 
     /// Create a marketplace with a fixed bidding and listing rate and a percentage commission.
-    public entry fun init(
+    public entry fun init_entry(
         creator: &signer,
         fee_address: address,
         bidding_fee: u64,
@@ -82,7 +80,7 @@ module marketplace::fee_schedule {
         commission_denominator: u64,
         commission_numerator: u64,
     ) {
-        init_internal(
+        init(
             creator,
             fee_address,
             bidding_fee,
@@ -93,7 +91,7 @@ module marketplace::fee_schedule {
     }
 
 
-    public fun init_internal(
+    public fun init(
         creator: &signer,
         fee_address: address,
         bidding_fee: u64,
@@ -134,7 +132,6 @@ module marketplace::fee_schedule {
         let marketplace = FeeSchedule {
             fee_address,
             extend_ref,
-            mutation_events: object::new_event_handle(&fee_schedule_signer),
         };
         move_to(&fee_schedule_signer, marketplace);
 
@@ -157,7 +154,7 @@ module marketplace::fee_schedule {
         let fee_schedule_obj = borrow_global_mut<FeeSchedule>(fee_schedule_addr);
         fee_schedule_obj.fee_address = fee_address;
         let updated_resource = string::utf8(b"fee_address");
-        event::emit_event(&mut fee_schedule_obj.mutation_events, MutationEvent { updated_resource });
+        event::emit(Mutation { marketplace: fee_schedule_addr, updated_resource });
     }
 
     /// Remove any existing listing fees and set a fixed rate listing fee.
@@ -169,7 +166,7 @@ module marketplace::fee_schedule {
         let fee_schedule_signer = remove_listing_fee(creator, marketplace);
         move_to(&fee_schedule_signer, FixedRateListingFee { listing_fee: fee });
         let updated_resource = type_info::type_name<FixedRateListingFee>();
-        emit_mutation_event(signer::address_of(&fee_schedule_signer), updated_resource);
+        event::emit(Mutation { marketplace: signer::address_of(&fee_schedule_signer), updated_resource });
     }
 
     inline fun remove_listing_fee(
@@ -192,7 +189,7 @@ module marketplace::fee_schedule {
         let fee_schedule_signer = remove_bidding_fee(creator, marketplace);
         move_to(&fee_schedule_signer, FixedRateBiddingFee { bidding_fee: fee });
         let updated_resource = type_info::type_name<FixedRateListingFee>();
-        emit_mutation_event(signer::address_of(&fee_schedule_signer), updated_resource);
+        event::emit(Mutation { marketplace: signer::address_of(&fee_schedule_signer), updated_resource });
     }
 
     inline fun remove_bidding_fee(
@@ -215,7 +212,7 @@ module marketplace::fee_schedule {
         let fee_schedule_signer = remove_commission(creator, marketplace);
         move_to(&fee_schedule_signer, FixedRateCommission { commission });
         let updated_resource = type_info::type_name<FixedRateListingFee>();
-        emit_mutation_event(signer::address_of(&fee_schedule_signer), updated_resource);
+        event::emit(Mutation { marketplace: signer::address_of(&fee_schedule_signer), updated_resource });
     }
 
     /// Remove any existing commission and set a percentage rate commission.
@@ -237,7 +234,7 @@ module marketplace::fee_schedule {
         let fee_schedule_signer = remove_commission(creator, marketplace);
         move_to(&fee_schedule_signer, PercentageRateCommission { denominator, numerator });
         let updated_resource = type_info::type_name<FixedRateListingFee>();
-        emit_mutation_event(signer::address_of(&fee_schedule_signer), updated_resource);
+        event::emit(Mutation { marketplace: signer::address_of(&fee_schedule_signer), updated_resource });
     }
 
     inline fun remove_commission(
@@ -267,16 +264,7 @@ module marketplace::fee_schedule {
         (fee_schedule_signer, fee_schedule_addr)
     }
 
-    inline fun emit_mutation_event(
-        fee_schedule_addr: address,
-        updated_resource: String,
-    ) acquires FeeSchedule {
-        let marketplace = borrow_global_mut<FeeSchedule>(fee_schedule_addr);
-        event::emit_event(&mut marketplace.mutation_events, MutationEvent { updated_resource });
-    }
-
     // View functions
-
     #[view]
     public fun fee_address(marketplace: Object<FeeSchedule>): address acquires FeeSchedule {
         let fee_schedule_addr = assert_exists_internal(&marketplace);
@@ -319,7 +307,7 @@ module marketplace::fee_schedule {
             borrow_global<FixedRateCommission>(fee_schedule_addr).commission
         } else if (exists<PercentageRateCommission>(fee_schedule_addr)) {
             let fees = borrow_global<PercentageRateCommission>(fee_schedule_addr);
-            ((price as u128) * (fees.numerator as u128) / (fees.denominator as u128) as u64)
+            math64::mul_div(price, fees.numerator, fees.denominator)
         } else {
             0
         }
@@ -349,7 +337,7 @@ module marketplace::fee_schedule {
     ) acquires FeeSchedule, FixedRateBiddingFee, FixedRateCommission, FixedRateListingFee, PercentageRateCommission {
         let creator_addr = signer::address_of(creator);
         account::create_account_for_test(creator_addr);
-        let obj = init_internal(creator, creator_addr, 0, 0, 1, 0);
+        let obj = init(creator, creator_addr, 0, 0, 1, 0);
 
         assert!(fee_address(obj) == creator_addr, 0);
         assert!(listing_fee(obj, 5) == 0, 0);
@@ -403,7 +391,7 @@ module marketplace::fee_schedule {
     fun test_non_creator_fee_address(creator: &signer, non_creator: &signer) acquires FeeSchedule {
         let creator_addr = signer::address_of(creator);
         account::create_account_for_test(creator_addr);
-        let obj = init_internal(creator, creator_addr, 0, 0, 1, 0);
+        let obj = init(creator, creator_addr, 0, 0, 1, 0);
         set_fee_address(non_creator, obj, @0x0);
     }
 
@@ -415,7 +403,7 @@ module marketplace::fee_schedule {
     ) acquires FeeSchedule, FixedRateListingFee {
         let creator_addr = signer::address_of(creator);
         account::create_account_for_test(creator_addr);
-        let obj = init_internal(creator, creator_addr, 0, 0, 1, 0);
+        let obj = init(creator, creator_addr, 0, 0, 1, 0);
         set_fixed_rate_listing_fee(non_creator, obj, 5);
     }
 
@@ -427,7 +415,7 @@ module marketplace::fee_schedule {
     ) acquires FeeSchedule, FixedRateBiddingFee {
         let creator_addr = signer::address_of(creator);
         account::create_account_for_test(creator_addr);
-        let obj = init_internal(creator, creator_addr, 0, 0, 1, 0);
+        let obj = init(creator, creator_addr, 0, 0, 1, 0);
         set_fixed_rate_bidding_fee(non_creator, obj, 6);
     }
 
@@ -439,7 +427,7 @@ module marketplace::fee_schedule {
     ) acquires FeeSchedule, FixedRateCommission, PercentageRateCommission {
         let creator_addr = signer::address_of(creator);
         account::create_account_for_test(creator_addr);
-        let obj = init_internal(creator, creator_addr, 0, 0, 1, 0);
+        let obj = init(creator, creator_addr, 0, 0, 1, 0);
         set_percentage_rate_commission(non_creator, obj, 10, 1);
     }
 
@@ -451,7 +439,7 @@ module marketplace::fee_schedule {
     ) acquires FeeSchedule, FixedRateCommission, PercentageRateCommission {
         let creator_addr = signer::address_of(creator);
         account::create_account_for_test(creator_addr);
-        let obj = init_internal(creator, creator_addr, 0, 0, 1, 0);
+        let obj = init(creator, creator_addr, 0, 0, 1, 0);
         set_fixed_rate_commission(non_creator, obj, 8);
     }
 
@@ -460,7 +448,7 @@ module marketplace::fee_schedule {
     fun test_init_zero_denominator_percentage_commission(creator: &signer) {
         let creator_addr = signer::address_of(creator);
         account::create_account_for_test(creator_addr);
-        init_internal(creator, creator_addr, 0, 0, 0, 0);
+        init(creator, creator_addr, 0, 0, 0, 0);
     }
 
     #[test(creator = @0x123)]
@@ -470,7 +458,7 @@ module marketplace::fee_schedule {
     ) acquires FeeSchedule, FixedRateCommission, PercentageRateCommission {
         let creator_addr = signer::address_of(creator);
         account::create_account_for_test(creator_addr);
-        let obj = init_internal(creator, creator_addr, 0, 0, 1, 0);
+        let obj = init(creator, creator_addr, 0, 0, 1, 0);
         set_percentage_rate_commission(creator, obj, 0, 0);
     }
 
@@ -479,7 +467,7 @@ module marketplace::fee_schedule {
     fun test_init_too_big_percentage_commission(creator: &signer) {
         let creator_addr = signer::address_of(creator);
         account::create_account_for_test(creator_addr);
-        init_internal(creator, creator_addr, 0, 0, 1, 2);
+        init(creator, creator_addr, 0, 0, 1, 2);
     }
 
     #[test(creator = @0x123)]
@@ -489,7 +477,7 @@ module marketplace::fee_schedule {
     ) acquires FeeSchedule, FixedRateCommission, PercentageRateCommission {
         let creator_addr = signer::address_of(creator);
         account::create_account_for_test(creator_addr);
-        let obj = init_internal(creator, creator_addr, 0, 0, 1, 0);
+        let obj = init(creator, creator_addr, 0, 0, 1, 0);
         set_percentage_rate_commission(creator, obj, 1, 2);
     }
 }

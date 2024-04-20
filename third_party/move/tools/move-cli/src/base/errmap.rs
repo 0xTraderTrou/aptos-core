@@ -3,6 +3,7 @@
 
 use super::reroot_path;
 use clap::*;
+use move_model::metadata::{CompilerVersion, LanguageVersion};
 use move_package::{BuildConfig, ModelConfig};
 use std::path::PathBuf;
 
@@ -16,7 +17,7 @@ pub struct Errmap {
     #[clap(long)]
     pub error_prefix: Option<String>,
     /// The file to serialize the generated error map to.
-    #[clap(long, default_value = "error_map", parse(from_os_str))]
+    #[clap(long, default_value = "error_map", value_parser)]
     pub output_file: PathBuf,
 }
 
@@ -38,6 +39,8 @@ impl Errmap {
         let model = config.move_model_for_package(&rerooted_path, ModelConfig {
             all_files_as_targets: true,
             target_filter: None,
+            compiler_version: CompilerVersion::default(),
+            language_version: LanguageVersion::default(),
         })?;
         let mut errmap_gen = move_errmapgen::ErrmapGen::new(&model, &errmap_options);
         errmap_gen.gen();

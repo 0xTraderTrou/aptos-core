@@ -2,17 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod analyze;
+pub mod local_testnet;
 
+use self::local_testnet::RunLocalnet;
 use crate::{
     common::{
         types::{
-            CliCommand, CliError, CliResult, CliTypedResult, ConfigSearchMode,
-            OptionalPoolAddressArgs, PoolAddressArgs, ProfileOptions, PromptOptions, RestOptions,
-            TransactionOptions, TransactionSummary,
+            CliCommand, CliError, CliResult, CliTypedResult, OptionalPoolAddressArgs,
+            PoolAddressArgs, ProfileOptions, RestOptions, TransactionOptions, TransactionSummary,
         },
-        utils::{prompt_yes_with_override, read_from_file},
+        utils::read_from_file,
     },
-    config::GlobalConfig,
     genesis::git::from_yaml,
     node::analyze::{
         analyze_validators::{AnalyzeValidators, ValidatorStats},
@@ -25,9 +25,7 @@ use aptos_backup_cli::{
     utils::GlobalRestoreOpt,
 };
 use aptos_cached_packages::aptos_stdlib;
-use aptos_config::config::NodeConfig;
 use aptos_crypto::{bls12381, bls12381::PublicKey, x25519, ValidCryptoMaterialStringExt};
-use aptos_faucet_core::server::{FunderKeyEnum, RunConfig};
 use aptos_genesis::config::{HostAndPort, OperatorConfiguration};
 use aptos_logger::Level;
 use aptos_network_checker::args::{
@@ -50,20 +48,13 @@ use async_trait::async_trait;
 use bcs::Result;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::Parser;
-use futures::FutureExt;
-use hex::FromHex;
-use rand::{rngs::StdRng, SeedableRng};
-use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     convert::{TryFrom, TryInto},
     path::PathBuf,
-    pin::Pin,
-    thread,
     time::Duration,
 };
-use tokio::time::Instant;
 
 const SECS_TO_MICROSECS: u64 = 1_000_000;
 
@@ -85,7 +76,8 @@ pub enum NodeTool {
     ShowValidatorConfig(ShowValidatorConfig),
     ShowValidatorSet(ShowValidatorSet),
     ShowValidatorStake(ShowValidatorStake),
-    RunLocalTestnet(RunLocalTestnet),
+    #[clap(aliases = &["run-local-testnet"])]
+    RunLocalnet(RunLocalnet),
     UpdateConsensusKey(UpdateConsensusKey),
     UpdateValidatorNetworkAddresses(UpdateValidatorNetworkAddresses),
 }
@@ -109,7 +101,10 @@ impl NodeTool {
             ShowValidatorSet(tool) => tool.execute_serialized().await,
             ShowValidatorStake(tool) => tool.execute_serialized().await,
             ShowValidatorConfig(tool) => tool.execute_serialized().await,
-            RunLocalTestnet(tool) => tool.execute_serialized_without_logger().await,
+            RunLocalnet(tool) => tool
+                .execute_serialized_without_logger()
+                .await
+                .map(|_| "".to_string()),
             UpdateConsensusKey(tool) => tool.execute_serialized().await,
             UpdateValidatorNetworkAddresses(tool) => tool.execute_serialized().await,
         }
@@ -121,7 +116,7 @@ pub struct OperatorConfigFileArgs {
     /// Operator Configuration file
     ///
     /// Config file created from the `genesis set-validator-configuration` command
-    #[clap(long, parse(from_os_str))]
+    #[clap(long, value_parser)]
     pub(crate) operator_config_file: Option<PathBuf>,
 }
 
@@ -142,13 +137,13 @@ pub struct ValidatorConsensusKeyArgs {
     /// Hex encoded Consensus public key
     ///
     /// The key should be a BLS12-381 public key
-    #[clap(long, parse(try_from_str = bls12381::PublicKey::from_encoded_string))]
+    #[clap(long, value_parser = bls12381::PublicKey::from_encoded_string)]
     pub(crate) consensus_public_key: Option<bls12381::PublicKey>,
 
     /// Hex encoded Consensus proof of possession
     ///
     /// The key should be a BLS12-381 proof of possession
-    #[clap(long, parse(try_from_str = bls12381::ProofOfPossession::from_encoded_string))]
+    #[clap(long, value_parser = bls12381::ProofOfPossession::from_encoded_string)]
     pub(crate) proof_of_possession: Option<bls12381::ProofOfPossession>,
 }
 
@@ -196,7 +191,7 @@ pub struct ValidatorNetworkAddressesArgs {
     pub(crate) validator_host: Option<HostAndPort>,
 
     /// Validator x25519 public network key
-    #[clap(long, parse(try_from_str = x25519::PublicKey::from_encoded_string))]
+    #[clap(long, value_parser = x25519::PublicKey::from_encoded_string)]
     pub(crate) validator_network_public_key: Option<x25519::PublicKey>,
 
     /// Host and port pair for the fullnode
@@ -206,7 +201,7 @@ pub struct ValidatorNetworkAddressesArgs {
     pub(crate) full_node_host: Option<HostAndPort>,
 
     /// Full node x25519 public network key
-    #[clap(long, parse(try_from_str = x25519::PublicKey::from_encoded_string))]
+    #[clap(long, value_parser = x25519::PublicKey::from_encoded_string)]
     pub(crate) full_node_network_public_key: Option<x25519::PublicKey>,
 }
 
@@ -308,7 +303,7 @@ pub struct StakePoolResult {
 #[derive(Parser)]
 pub struct GetStakePool {
     /// The owner address of the stake pool
-    #[clap(long, parse(try_from_str=crate::common::types::load_account_arg))]
+    #[clap(long, value_parser = crate::common::types::load_account_arg)]
     pub(crate) owner_address: AccountAddress,
     #[clap(flatten)]
     pub(crate) rest_options: RestOptions,
@@ -854,27 +849,36 @@ pub struct ValidatorSetSummary {
     pub total_joining_power: u128,
 }
 
+impl ValidatorSetSummary {
+    fn convert_to_summary_vec(
+        validator_info: Vec<ValidatorInfo>,
+    ) -> Result<Vec<ValidatorInfoSummary>, bcs::Error> {
+        let mut validators: Vec<ValidatorInfoSummary> = vec![];
+        for validator in validator_info.iter() {
+            match validator.try_into() {
+                Ok(validator) => validators.push(validator),
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(validators)
+    }
+}
+
 impl TryFrom<&ValidatorSet> for ValidatorSetSummary {
     type Error = bcs::Error;
 
     fn try_from(set: &ValidatorSet) -> Result<Self, Self::Error> {
+        let active_validators: Vec<ValidatorInfoSummary> =
+            Self::convert_to_summary_vec(set.active_validators.clone())?;
+        let pending_inactive: Vec<ValidatorInfoSummary> =
+            Self::convert_to_summary_vec(set.pending_inactive.clone())?;
+        let pending_active: Vec<ValidatorInfoSummary> =
+            Self::convert_to_summary_vec(set.pending_active.clone())?;
         Ok(ValidatorSetSummary {
             scheme: set.scheme,
-            active_validators: set
-                .active_validators
-                .iter()
-                .filter_map(|validator| validator.try_into().ok())
-                .collect(),
-            pending_inactive: set
-                .pending_inactive
-                .iter()
-                .filter_map(|validator| validator.try_into().ok())
-                .collect(),
-            pending_active: set
-                .pending_active
-                .iter()
-                .filter_map(|validator| validator.try_into().ok())
-                .collect(),
+            active_validators,
+            pending_inactive,
+            pending_active,
             total_voting_power: set.total_voting_power,
             total_joining_power: set.total_joining_power,
         })
@@ -977,11 +981,17 @@ impl ValidatorConfig {
     }
 
     pub fn fullnode_network_addresses(&self) -> Result<Vec<NetworkAddress>, bcs::Error> {
-        bcs::from_bytes(&self.fullnode_network_addresses)
+        match &self.validator_network_addresses.is_empty() {
+            true => Ok(vec![]),
+            false => bcs::from_bytes(&self.fullnode_network_addresses),
+        }
     }
 
     pub fn validator_network_addresses(&self) -> Result<Vec<NetworkAddress>, bcs::Error> {
-        bcs::from_bytes(&self.validator_network_addresses)
+        match &self.validator_network_addresses.is_empty() {
+            true => Ok(vec![]),
+            false => bcs::from_bytes(&self.validator_network_addresses),
+        }
     }
 }
 
@@ -1009,7 +1019,6 @@ impl TryFrom<&ValidatorConfig> for ValidatorConfigSummary {
         };
         Ok(ValidatorConfigSummary {
             consensus_public_key,
-            // TODO: We should handle if some of these are not parsable
             validator_network_addresses: config.validator_network_addresses()?,
             fullnode_network_addresses: config.fullnode_network_addresses()?,
             validator_index: config.validator_index,
@@ -1031,213 +1040,6 @@ impl From<&ValidatorConfigSummary> for ValidatorConfig {
             fullnode_network_addresses: bcs::to_bytes(&summary.fullnode_network_addresses).unwrap(),
             validator_index: summary.validator_index,
         }
-    }
-}
-
-const MAX_WAIT_S: u64 = 30;
-const WAIT_INTERVAL_MS: u64 = 100;
-const TESTNET_FOLDER: &str = "testnet";
-
-/// Run local testnet
-///
-/// This local testnet will run it's own Genesis and run as a single node
-/// network locally.  Optionally, a faucet can be added for minting APT coins.
-#[derive(Parser)]
-pub struct RunLocalTestnet {
-    /// An overridable config template for the test node
-    ///
-    /// If provided, the config will be used, and any needed configuration for the local testnet
-    /// will override the config's values
-    #[clap(long, parse(from_os_str))]
-    config_path: Option<PathBuf>,
-
-    /// The directory to save all files for the node
-    ///
-    /// Defaults to .aptos/testnet
-    #[clap(long, parse(from_os_str))]
-    test_dir: Option<PathBuf>,
-
-    /// Path to node configuration file override for local test mode.
-    ///
-    /// If provided, the default node config will be overridden by the config in the given file.
-    /// Cannot be used with --config-path
-    #[clap(long, parse(from_os_str), conflicts_with("config-path"))]
-    test_config_override: Option<PathBuf>,
-
-    /// Random seed for key generation in test mode
-    ///
-    /// This allows you to have deterministic keys for testing
-    #[clap(long, parse(try_from_str = FromHex::from_hex))]
-    seed: Option<[u8; 32]>,
-
-    /// Clean the state and start with a new chain at genesis
-    ///
-    /// This will wipe the aptosdb in `test-dir` to remove any incompatible changes, and start
-    /// the chain fresh.  Note, that you will need to publish the module again and distribute funds
-    /// from the faucet accordingly
-    #[clap(long)]
-    force_restart: bool,
-
-    /// Run a faucet alongside the node
-    ///
-    /// Allows you to run a faucet alongside the node to create and fund accounts for testing
-    #[clap(long)]
-    with_faucet: bool,
-
-    /// Port to run the faucet on
-    ///
-    /// When running, you'll be able to use the faucet at `http://localhost:<port>/mint` e.g.
-    /// `http//localhost:8080/mint`
-    #[clap(long, default_value = "8081")]
-    faucet_port: u16,
-
-    /// Disable the delegation of faucet minting to a dedicated account
-    #[clap(long)]
-    do_not_delegate: bool,
-
-    #[clap(flatten)]
-    prompt_options: PromptOptions,
-}
-
-#[async_trait]
-impl CliCommand<()> for RunLocalTestnet {
-    fn command_name(&self) -> &'static str {
-        "RunLocalTestnet"
-    }
-
-    async fn execute(mut self) -> CliTypedResult<()> {
-        let rng = self
-            .seed
-            .map(StdRng::from_seed)
-            .unwrap_or_else(StdRng::from_entropy);
-
-        let global_config = GlobalConfig::load()?;
-        let test_dir = match self.test_dir {
-            Some(test_dir) => test_dir,
-            None => global_config
-                .get_config_location(ConfigSearchMode::CurrentDirAndParents)?
-                .join(TESTNET_FOLDER),
-        };
-
-        // Remove the current test directory and start with a new node
-        if self.force_restart && test_dir.exists() {
-            prompt_yes_with_override(
-                "Are you sure you want to delete the existing chain?",
-                self.prompt_options,
-            )?;
-            std::fs::remove_dir_all(test_dir.as_path()).map_err(|err| {
-                CliError::IO(format!("Failed to delete {}", test_dir.display()), err)
-            })?;
-        }
-
-        // Spawn the node in a separate thread
-        let config_path = self.config_path.clone();
-        let test_dir_copy = test_dir.clone();
-        let node_thread_handle = thread::spawn(move || {
-            let result = aptos_node::setup_test_environment_and_start_node(
-                config_path,
-                self.test_config_override,
-                Some(test_dir_copy),
-                false,
-                false,
-                aptos_cached_packages::head_release_bundle(),
-                rng,
-            );
-            eprintln!("Node stopped unexpectedly {:#?}", result);
-        });
-
-        // Run faucet if selected
-        let maybe_faucet_future = if self.with_faucet {
-            let max_wait = Duration::from_secs(MAX_WAIT_S);
-            let wait_interval = Duration::from_millis(WAIT_INTERVAL_MS);
-
-            // Load the config to get the rest port
-            let config_path = test_dir.join("0").join("node.yaml");
-
-            // We have to wait for the node to be configured above in the other thread
-            let mut config = None;
-            let start = Instant::now();
-            while start.elapsed() < max_wait {
-                if let Ok(loaded_config) = NodeConfig::load_from_path(&config_path) {
-                    config = Some(loaded_config);
-                    break;
-                }
-                tokio::time::sleep(wait_interval).await;
-            }
-
-            // Retrieve the port from the local node
-            let port = if let Some(config) = config {
-                config.api.address.port()
-            } else {
-                return Err(CliError::UnexpectedError(
-                    "Failed to find node configuration to start faucet".to_string(),
-                ));
-            };
-
-            // Check that the REST API is ready
-            let rest_url = Url::parse(&format!("http://localhost:{}", port)).map_err(|err| {
-                CliError::UnexpectedError(format!("Failed to parse localhost URL {}", err))
-            })?;
-            let rest_client = aptos_rest_client::Client::new(rest_url.clone());
-            let start = Instant::now();
-            let mut started_successfully = false;
-
-            while start.elapsed() < max_wait {
-                if rest_client.get_index().await.is_ok() {
-                    started_successfully = true;
-                    break;
-                }
-                tokio::time::sleep(wait_interval).await
-            }
-
-            if !started_successfully {
-                return Err(CliError::UnexpectedError(format!(
-                    "Local node at {} did not start up before faucet",
-                    rest_url
-                )));
-            }
-
-            // Build the config for the faucet service.
-            let faucet_config = RunConfig::build_for_cli(
-                rest_url,
-                self.faucet_port,
-                FunderKeyEnum::KeyFile(test_dir.join("mint.key")),
-                self.do_not_delegate,
-                None,
-            );
-
-            // Start the faucet
-            Some(faucet_config.run().map(|result| {
-                eprintln!("Faucet stopped unexpectedly {:#?}", result);
-            }))
-        } else {
-            None
-        };
-
-        // Collect futures that should never end.
-        let mut futures: Vec<Pin<Box<dyn futures::Future<Output = ()> + Send>>> = Vec::new();
-
-        // This future just waits for the node thread.
-        let node_future = async move {
-            loop {
-                if node_thread_handle.is_finished() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-        };
-
-        // Wait for all the futures. We should never get past this point unless
-        // something goes wrong or the user signals for the process to end.
-        futures.push(Box::pin(node_future));
-        if let Some(faucet_future) = maybe_faucet_future {
-            futures.push(Box::pin(faucet_future));
-        }
-        futures::future::select_all(futures).await;
-
-        Err(CliError::UnexpectedError(
-            "One of the components stopped unexpectedly".to_string(),
-        ))
     }
 }
 
@@ -1352,7 +1154,7 @@ pub struct AnalyzeValidatorPerformance {
     /// First epoch to analyze
     ///
     /// Defaults to the first epoch
-    #[clap(long, default_value = "-2")]
+    #[clap(long, default_value_t = -2)]
     pub start_epoch: i64,
 
     /// Last epoch to analyze
@@ -1362,13 +1164,13 @@ pub struct AnalyzeValidatorPerformance {
     pub end_epoch: Option<i64>,
 
     /// Analyze mode for the validator: [All, DetailedEpochTable, ValidatorHealthOverTime, NetworkHealthOverTime]
-    #[clap(arg_enum, long)]
+    #[clap(value_enum, ignore_case = true, long)]
     pub(crate) analyze_mode: AnalyzeMode,
 
     /// Filter of stake pool addresses to analyze
     ///
     /// Defaults to all stake pool addresses
-    #[clap(long, multiple_values = true, parse(try_from_str=crate::common::types::load_account_arg))]
+    #[clap(long, num_args = 0.., value_parser = crate::common::types::load_account_arg)]
     pub pool_addresses: Vec<AccountAddress>,
 
     #[clap(flatten)]
@@ -1377,7 +1179,7 @@ pub struct AnalyzeValidatorPerformance {
     pub(crate) profile_options: ProfileOptions,
 }
 
-#[derive(PartialEq, Eq, clap::ArgEnum, Clone)]
+#[derive(PartialEq, Eq, clap::ValueEnum, Clone)]
 pub enum AnalyzeMode {
     /// Print all other modes simultaneously
     All,
@@ -1634,6 +1436,7 @@ impl Time {
     pub fn new(time: Duration) -> Self {
         let date_time =
             NaiveDateTime::from_timestamp_opt(time.as_secs() as i64, time.subsec_nanos()).unwrap();
+        #[allow(deprecated)]
         let utc_time = DateTime::from_utc(date_time, Utc);
         // TODO: Allow configurable time zone
         Self {
@@ -1658,14 +1461,10 @@ mod tests {
 
     // TODO: there have to be cleaner ways to test things. Maybe a CLI test framework?
 
+    // FIXME: Remove this test, it's very fragile and move to E2E CLI test framework
     #[tokio::test]
     // Verifies basic properties about the network connectivity checker
     async fn test_check_network_connectivity() {
-        // Verify the help function works
-        let args = &["aptos", "node", "check-network-connectivity", "--help"];
-        let help_message = run_tool_with_args(args).await.unwrap_err();
-        assert_contains(help_message, "USAGE:"); // We expect the command to return USAGE info
-
         // Verify that an invalid address will return an error
         let args = &[
             "aptos",
@@ -1682,7 +1481,7 @@ mod tests {
         // Verify that an invalid chain-id will return an error
         let args = &["aptos", "node", "check-network-connectivity", "--address", "/ip4/34.70.116.169/tcp/6182/noise-ik/0x249f3301db104705652e0a0c471b46d13172b2baf14e31f007413f3baee46b0c/handshake/0", "--chain-id", "invalid-chain"];
         let error_message = run_tool_with_args(args).await.unwrap_err();
-        assert_contains(error_message, "Invalid value");
+        assert_contains(error_message, "invalid value");
 
         // Verify that a failure to connect will return a timeout
         let args = &["aptos", "node", "check-network-connectivity", "--address", "/ip4/31.71.116.169/tcp/0001/noise-ik/0x249f3301db104705652e0a0c471b46d13172b2baf14e31f007413f3baee46b0c/handshake/0", "--chain-id", "testnet"];

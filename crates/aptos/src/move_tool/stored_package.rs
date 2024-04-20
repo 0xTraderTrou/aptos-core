@@ -10,7 +10,7 @@ use aptos_rest_client::Client;
 use aptos_types::account_address::AccountAddress;
 use move_package::compilation::package_layout::CompiledPackageLayout;
 use reqwest::Url;
-use std::{fs, path::Path};
+use std::{collections::BTreeMap, fmt, fs, path::Path};
 
 // TODO: this is a first naive implementation of the package registry. Before mainnet
 // we need to use tables for the package registry.
@@ -18,6 +18,7 @@ use std::{fs, path::Path};
 /// Represents the package registry at a given account.
 pub struct CachedPackageRegistry {
     inner: PackageRegistry,
+    bytecode: BTreeMap<String, Vec<u8>>,
 }
 
 /// Represents the package metadata found in an registry.
@@ -30,16 +31,41 @@ pub struct CachedModuleMetadata<'a> {
     metadata: &'a ModuleMetadata,
 }
 
+impl fmt::Display for CachedPackageMetadata<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "{}", self.metadata)?;
+        Ok(())
+    }
+}
+
 impl CachedPackageRegistry {
     /// Creates a new registry.
-    pub async fn create(url: Url, addr: AccountAddress) -> anyhow::Result<Self> {
+    pub async fn create(
+        url: Url,
+        addr: AccountAddress,
+        with_bytecode: bool,
+    ) -> anyhow::Result<Self> {
         let client = Client::new(url);
         // Need to use a different type to deserialize JSON
         let inner = client
             .get_account_resource_bcs::<PackageRegistry>(addr, "0x1::code::PackageRegistry")
             .await?
             .into_inner();
-        Ok(Self { inner })
+        let mut bytecode = BTreeMap::new();
+        if with_bytecode {
+            for pack in &inner.packages {
+                for module in &pack.modules {
+                    let bytes = client
+                        .get_account_module(addr, &module.name)
+                        .await?
+                        .into_inner()
+                        .bytecode
+                        .0;
+                    bytecode.insert(module.name.clone(), bytes);
+                }
+            }
+        }
+        Ok(Self { inner, bytecode })
     }
 
     /// Returns the list of packages in this registry by name.
@@ -79,6 +105,17 @@ impl CachedPackageRegistry {
             }
         }
         bail!("package `{}` not found", name)
+    }
+
+    /// Gets the bytecode associated with the module.
+    pub async fn get_bytecode(
+        &self,
+        module_name: impl AsRef<str>,
+    ) -> anyhow::Result<Option<&[u8]>> {
+        Ok(self
+            .bytecode
+            .get(module_name.as_ref())
+            .map(|v| v.as_slice()))
     }
 }
 
@@ -142,6 +179,18 @@ impl<'a> CachedPackageMetadata<'a> {
         Ok(())
     }
 
+    pub fn save_bytecode_to_disk(
+        &self,
+        path: &Path,
+        module_name: &str,
+        bytecode: &[u8],
+    ) -> anyhow::Result<()> {
+        let bytecode_dir = path.join(CompiledPackageLayout::CompiledModules.path());
+        fs::create_dir_all(&bytecode_dir)?;
+        fs::write(bytecode_dir.join(format!("{}.mv", module_name)), bytecode)?;
+        Ok(())
+    }
+
     pub fn verify(&self, package_metadata: &PackageMetadata) -> anyhow::Result<()> {
         let self_metadata = self.metadata;
 
@@ -174,12 +223,6 @@ impl<'a> CachedPackageMetadata<'a> {
                 "Upgrade policy doesn't match {:?} : {:?}",
                 package_metadata.upgrade_policy,
                 self_metadata.upgrade_policy
-            )
-        } else if self_metadata.upgrade_number != package_metadata.upgrade_number {
-            bail!(
-                "Upgrade number doesn't match {:?} : {:?}",
-                package_metadata.upgrade_number,
-                self_metadata.upgrade_number
             )
         } else if self_metadata.extension != package_metadata.extension {
             bail!(

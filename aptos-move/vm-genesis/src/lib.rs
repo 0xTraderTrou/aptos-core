@@ -13,29 +13,41 @@ use aptos_crypto::{
     HashValue, PrivateKey, Uniform,
 };
 use aptos_framework::{ReleaseBundle, ReleasePackage};
-use aptos_gas::{
-    AbstractValueSizeGasParameters, AptosGasParameters, ChangeSetConfigs, InitialGasSchedule,
-    NativeGasParameters, ToOnChainGasSchedule, LATEST_GAS_FEATURE_VERSION,
+use aptos_gas_schedule::{
+    AptosGasParameters, InitialGasSchedule, MiscGasParameters, NativeGasParameters,
+    ToOnChainGasSchedule, LATEST_GAS_FEATURE_VERSION,
 };
 use aptos_types::{
     account_config::{self, aptos_test_root_address, events::NewEpochEvent, CORE_CODE_ADDRESS},
     chain_id::ChainId,
-    contract_event::ContractEvent,
+    contract_event::{ContractEvent, ContractEventV1},
+    jwks::{
+        patch::{PatchJWKMoveStruct, PatchUpsertJWK},
+        rsa::RSA_JWK,
+    },
+    keyless::{
+        self, test_utils::get_sample_iss, Groth16VerificationKey, DEVNET_VERIFICATION_KEY,
+        KEYLESS_ACCOUNT_MODULE_NAME,
+    },
+    move_utils::as_move_value::AsMoveValue,
     on_chain_config::{
         FeatureFlag, Features, GasScheduleV2, OnChainConsensusConfig, OnChainExecutionConfig,
-        TimedFeatures, APTOS_MAX_KNOWN_VERSION,
+        OnChainJWKConsensusConfig, OnChainRandomnessConfig, RandomnessConfigMoveStruct,
+        TimedFeaturesBuilder, APTOS_MAX_KNOWN_VERSION,
     },
     transaction::{authenticator::AuthenticationKey, ChangeSet, Transaction, WriteSetPayload},
+    write_set::TransactionWrite,
 };
 use aptos_vm::{
     data_cache::AsMoveResolver,
     move_vm_ext::{MoveVmExt, SessionExt, SessionId},
 };
+use aptos_vm_types::storage::change_set_configs::ChangeSetConfigs;
 use move_core_types::{
     account_address::AccountAddress,
     identifier::Identifier,
     language_storage::{ModuleId, TypeTag},
-    value::{serialize_values, MoveValue},
+    value::{serialize_values, MoveTypeLayout, MoveValue},
 };
 use move_vm_types::gas::UnmeteredGasMeter;
 use once_cell::sync::Lazy;
@@ -49,6 +61,13 @@ const GENESIS_MODULE_NAME: &str = "genesis";
 const GOVERNANCE_MODULE_NAME: &str = "aptos_governance";
 const CODE_MODULE_NAME: &str = "code";
 const VERSION_MODULE_NAME: &str = "version";
+const JWK_CONSENSUS_CONFIG_MODULE_NAME: &str = "jwk_consensus_config";
+const JWKS_MODULE_NAME: &str = "jwks";
+const CONFIG_BUFFER_MODULE_NAME: &str = "config_buffer";
+const DKG_MODULE_NAME: &str = "dkg";
+const RANDOMNESS_CONFIG_MODULE_NAME: &str = "randomness_config";
+const RANDOMNESS_MODULE_NAME: &str = "randomness";
+const RECONFIGURATION_STATE_MODULE_NAME: &str = "reconfiguration_state";
 
 const NUM_SECONDS_PER_YEAR: u64 = 365 * 24 * 60 * 60;
 const MICRO_SECONDS_PER_SECOND: u64 = 1_000_000;
@@ -69,6 +88,9 @@ pub struct GenesisConfiguration {
     pub voting_power_increase_limit: u64,
     pub employee_vesting_start: u64,
     pub employee_vesting_period_duration: u64,
+    pub initial_features_override: Option<Features>,
+    pub randomness_config_override: Option<OnChainRandomnessConfig>,
+    pub jwk_consensus_config_override: Option<OnChainJWKConsensusConfig>,
 }
 
 pub static GENESIS_KEYPAIR: Lazy<(Ed25519PrivateKey, Ed25519PublicKey)> = Lazy::new(|| {
@@ -81,7 +103,7 @@ pub static GENESIS_KEYPAIR: Lazy<(Ed25519PrivateKey, Ed25519PublicKey)> = Lazy::
 // Cannot be impl Default in GasScheduleV2, due to circular dependencies.
 pub fn default_gas_schedule() -> GasScheduleV2 {
     GasScheduleV2 {
-        feature_version: aptos_gas::LATEST_GAS_FEATURE_VERSION,
+        feature_version: LATEST_GAS_FEATURE_VERSION,
         entries: AptosGasParameters::initial().to_on_chain_gas_schedule(LATEST_GAS_FEATURE_VERSION),
     }
 }
@@ -105,19 +127,21 @@ pub fn encode_aptos_mainnet_genesis_transaction(
     let data_cache = state_view.as_move_resolver();
     let move_vm = MoveVmExt::new(
         NativeGasParameters::zeros(),
-        AbstractValueSizeGasParameters::zeros(),
+        MiscGasParameters::zeros(),
         LATEST_GAS_FEATURE_VERSION,
         ChainId::test().id(),
         Features::default(),
-        TimedFeatures::enable_all(),
+        TimedFeaturesBuilder::enable_all().build(),
+        &data_cache,
+        false,
     )
     .unwrap();
     let id1 = HashValue::zero();
-    let mut session = move_vm.new_session(&data_cache, SessionId::genesis(id1), true);
+    let mut session = move_vm.new_session(&data_cache, SessionId::genesis(id1));
 
     // On-chain genesis process.
-    let consensus_config = OnChainConsensusConfig::default();
-    let execution_config = OnChainExecutionConfig::default();
+    let consensus_config = OnChainConsensusConfig::default_for_genesis();
+    let execution_config = OnChainExecutionConfig::default_for_genesis();
     let gas_schedule = default_gas_schedule();
     initialize(
         &mut session,
@@ -127,7 +151,13 @@ pub fn encode_aptos_mainnet_genesis_transaction(
         &execution_config,
         &gas_schedule,
     );
-    initialize_features(&mut session);
+    initialize_features(
+        &mut session,
+        genesis_config
+            .initial_features_override
+            .clone()
+            .map(Features::into_flag_vec),
+    );
     initialize_aptos_coin(&mut session);
     initialize_on_chain_governance(&mut session, genesis_config);
     create_accounts(&mut session, accounts);
@@ -139,7 +169,7 @@ pub fn encode_aptos_mainnet_genesis_transaction(
     emit_new_block_and_epoch_event(&mut session);
 
     let configs = ChangeSetConfigs::unlimited_at_gas_feature_version(LATEST_GAS_FEATURE_VERSION);
-    let cs1 = session.finish(&mut (), &configs).unwrap();
+    let mut change_set = session.finish(&configs).unwrap();
 
     // Publish the framework, using a different session id, in case both scripts creates tables
     let state_view = GenesisStateView::new();
@@ -148,24 +178,28 @@ pub fn encode_aptos_mainnet_genesis_transaction(
     let mut id2_arr = [0u8; 32];
     id2_arr[31] = 1;
     let id2 = HashValue::new(id2_arr);
-    let mut session = move_vm.new_session(&data_cache, SessionId::genesis(id2), true);
+    let mut session = move_vm.new_session(&data_cache, SessionId::genesis(id2));
     publish_framework(&mut session, framework);
-    let cs2 = session.finish(&mut (), &configs).unwrap();
-    let change_set = cs1.squash(cs2, &configs).unwrap();
-
-    let (write_set, delta_change_set, events) = change_set.unpack();
+    let additional_change_set = session.finish(&configs).unwrap();
+    change_set
+        .squash_additional_change_set(additional_change_set, &configs)
+        .unwrap();
 
     // Publishing stdlib should not produce any deltas around aggregators and map to write ops and
     // not deltas. The second session only publishes the framework module bundle, which should not
     // produce deltas either.
     assert!(
-        delta_change_set.is_empty(),
+        change_set.aggregator_v1_delta_set().is_empty(),
         "non-empty delta change set in genesis"
     );
+    assert!(!change_set
+        .concrete_write_set_iter()
+        .any(|(_, op)| op.expect("expect only concrete write ops").is_deletion()));
+    verify_genesis_write_set(change_set.events());
 
-    assert!(!write_set.iter().any(|(_, op)| op.is_deletion()));
-    verify_genesis_write_set(&events);
-    let change_set = ChangeSet::new(write_set, events);
+    let change_set = change_set
+        .try_into_storage_change_set()
+        .expect("Constructing a ChangeSet from VMChangeSet should always succeed at genesis");
     Transaction::GenesisTransaction(WriteSetPayload::Direct(change_set))
 }
 
@@ -211,15 +245,17 @@ pub fn encode_genesis_change_set(
     let data_cache = state_view.as_move_resolver();
     let move_vm = MoveVmExt::new(
         NativeGasParameters::zeros(),
-        AbstractValueSizeGasParameters::zeros(),
+        MiscGasParameters::zeros(),
         LATEST_GAS_FEATURE_VERSION,
         ChainId::test().id(),
         Features::default(),
-        TimedFeatures::enable_all(),
+        TimedFeaturesBuilder::enable_all().build(),
+        &data_cache,
+        false,
     )
     .unwrap();
     let id1 = HashValue::zero();
-    let mut session = move_vm.new_session(&data_cache, SessionId::genesis(id1), true);
+    let mut session = move_vm.new_session(&data_cache, SessionId::genesis(id1));
 
     // On-chain genesis process.
     initialize(
@@ -230,24 +266,46 @@ pub fn encode_genesis_change_set(
         execution_config,
         gas_schedule,
     );
-    initialize_features(&mut session);
+    initialize_features(
+        &mut session,
+        genesis_config
+            .initial_features_override
+            .clone()
+            .map(Features::into_flag_vec),
+    );
     if genesis_config.is_test {
         initialize_core_resources_and_aptos_coin(&mut session, core_resources_key);
     } else {
         initialize_aptos_coin(&mut session);
     }
+    initialize_config_buffer(&mut session);
+    initialize_dkg(&mut session);
+    initialize_reconfiguration_state(&mut session);
+    let randomness_config = genesis_config
+        .randomness_config_override
+        .clone()
+        .unwrap_or_else(OnChainRandomnessConfig::default_for_genesis);
+    initialize_randomness_config(&mut session, randomness_config);
+    initialize_randomness_resources(&mut session);
     initialize_on_chain_governance(&mut session, genesis_config);
     create_and_initialize_validators(&mut session, validators);
     if genesis_config.is_test {
         allow_core_resources_to_set_version(&mut session);
     }
+    let jwk_consensus_config = genesis_config
+        .jwk_consensus_config_override
+        .clone()
+        .unwrap_or_else(OnChainJWKConsensusConfig::default_for_genesis);
+    initialize_jwk_consensus_config(&mut session, &jwk_consensus_config);
+    initialize_jwks_resources(&mut session);
+    initialize_keyless_accounts(&mut session, chain_id);
     set_genesis_end(&mut session);
 
     // Reconfiguration should happen after all on-chain invocations.
     emit_new_block_and_epoch_event(&mut session);
 
     let configs = ChangeSetConfigs::unlimited_at_gas_feature_version(LATEST_GAS_FEATURE_VERSION);
-    let cs1 = session.finish(&mut (), &configs).unwrap();
+    let mut change_set = session.finish(&configs).unwrap();
 
     let state_view = GenesisStateView::new();
     let data_cache = state_view.as_move_resolver();
@@ -256,24 +314,28 @@ pub fn encode_genesis_change_set(
     let mut id2_arr = [0u8; 32];
     id2_arr[31] = 1;
     let id2 = HashValue::new(id2_arr);
-    let mut session = move_vm.new_session(&data_cache, SessionId::genesis(id2), true);
+    let mut session = move_vm.new_session(&data_cache, SessionId::genesis(id2));
     publish_framework(&mut session, framework);
-    let cs2 = session.finish(&mut (), &configs).unwrap();
-    let change_set = cs1.squash(cs2, &configs).unwrap();
-
-    let (write_set, delta_change_set, events) = change_set.unpack();
+    let additional_change_set = session.finish(&configs).unwrap();
+    change_set
+        .squash_additional_change_set(additional_change_set, &configs)
+        .unwrap();
 
     // Publishing stdlib should not produce any deltas around aggregators and map to write ops and
     // not deltas. The second session only publishes the framework module bundle, which should not
     // produce deltas either.
     assert!(
-        delta_change_set.is_empty(),
+        change_set.aggregator_v1_delta_set().is_empty(),
         "non-empty delta change set in genesis"
     );
 
-    assert!(!write_set.iter().any(|(_, op)| op.is_deletion()));
-    verify_genesis_write_set(&events);
-    ChangeSet::new(write_set, events)
+    assert!(!change_set
+        .concrete_write_set_iter()
+        .any(|(_, op)| op.expect("expect only concrete write ops").is_deletion()));
+    verify_genesis_write_set(change_set.events());
+    change_set
+        .try_into_storage_change_set()
+        .expect("Constructing a ChangeSet from VMChangeSet should always succeed at genesis")
 }
 
 fn validate_genesis_config(genesis_config: &GenesisConfiguration) {
@@ -393,29 +455,9 @@ fn initialize(
     );
 }
 
-pub fn default_features() -> Vec<FeatureFlag> {
-    vec![
-        FeatureFlag::CODE_DEPENDENCY_CHECK,
-        FeatureFlag::TREAT_FRIEND_AS_PRIVATE,
-        FeatureFlag::SHA_512_AND_RIPEMD_160_NATIVES,
-        FeatureFlag::APTOS_STD_CHAIN_ID_NATIVES,
-        FeatureFlag::VM_BINARY_FORMAT_V6,
-        FeatureFlag::MULTI_ED25519_PK_VALIDATE_V2_NATIVES,
-        FeatureFlag::BLAKE2B_256_NATIVE,
-        FeatureFlag::RESOURCE_GROUPS,
-        FeatureFlag::MULTISIG_ACCOUNTS,
-        FeatureFlag::DELEGATION_POOLS,
-        FeatureFlag::ED25519_PUBKEY_VALIDATE_RETURN_FALSE_WRONG_LENGTH,
-        FeatureFlag::STRUCT_CONSTRUCTORS,
-        FeatureFlag::CRYPTOGRAPHY_ALGEBRA_NATIVES,
-        FeatureFlag::BLS12_381_STRUCTURES,
-        FeatureFlag::STORAGE_SLOT_METADATA,
-        FeatureFlag::CHARGE_INVARIANT_VIOLATION,
-    ]
-}
-
-fn initialize_features(session: &mut SessionExt) {
-    let features: Vec<u64> = default_features()
+fn initialize_features(session: &mut SessionExt, features_override: Option<Vec<FeatureFlag>>) {
+    let features: Vec<u64> = features_override
+        .unwrap_or_else(FeatureFlag::default_features)
         .into_iter()
         .map(|feature| feature as u64)
         .collect();
@@ -427,7 +469,7 @@ fn initialize_features(session: &mut SessionExt) {
     exec_function(
         session,
         "features",
-        "change_feature_flags",
+        "change_feature_flags_internal",
         vec![],
         serialized_values,
     );
@@ -438,6 +480,88 @@ fn initialize_aptos_coin(session: &mut SessionExt) {
         session,
         GENESIS_MODULE_NAME,
         "initialize_aptos_coin",
+        vec![],
+        serialize_values(&vec![MoveValue::Signer(CORE_CODE_ADDRESS)]),
+    );
+}
+
+fn initialize_config_buffer(session: &mut SessionExt) {
+    exec_function(
+        session,
+        CONFIG_BUFFER_MODULE_NAME,
+        "initialize",
+        vec![],
+        serialize_values(&vec![MoveValue::Signer(CORE_CODE_ADDRESS)]),
+    );
+}
+
+fn initialize_dkg(session: &mut SessionExt) {
+    exec_function(
+        session,
+        DKG_MODULE_NAME,
+        "initialize",
+        vec![],
+        serialize_values(&vec![MoveValue::Signer(CORE_CODE_ADDRESS)]),
+    );
+}
+
+fn initialize_randomness_config(
+    session: &mut SessionExt,
+    randomness_config: OnChainRandomnessConfig,
+) {
+    exec_function(
+        session,
+        RANDOMNESS_CONFIG_MODULE_NAME,
+        "initialize",
+        vec![],
+        serialize_values(&vec![
+            MoveValue::Signer(CORE_CODE_ADDRESS),
+            RandomnessConfigMoveStruct::from(randomness_config).as_move_value(),
+        ]),
+    );
+}
+
+fn initialize_randomness_resources(session: &mut SessionExt) {
+    exec_function(
+        session,
+        RANDOMNESS_MODULE_NAME,
+        "initialize",
+        vec![],
+        serialize_values(&vec![MoveValue::Signer(CORE_CODE_ADDRESS)]),
+    );
+}
+
+fn initialize_reconfiguration_state(session: &mut SessionExt) {
+    exec_function(
+        session,
+        RECONFIGURATION_STATE_MODULE_NAME,
+        "initialize",
+        vec![],
+        serialize_values(&vec![MoveValue::Signer(CORE_CODE_ADDRESS)]),
+    );
+}
+
+fn initialize_jwk_consensus_config(
+    session: &mut SessionExt,
+    jwk_consensus_config: &OnChainJWKConsensusConfig,
+) {
+    exec_function(
+        session,
+        JWK_CONSENSUS_CONFIG_MODULE_NAME,
+        "initialize",
+        vec![],
+        serialize_values(&vec![
+            MoveValue::Signer(CORE_CODE_ADDRESS),
+            jwk_consensus_config.as_move_value(),
+        ]),
+    );
+}
+
+fn initialize_jwks_resources(session: &mut SessionExt) {
+    exec_function(
+        session,
+        JWKS_MODULE_NAME,
+        "initialize",
         vec![],
         serialize_values(&vec![MoveValue::Signer(CORE_CODE_ADDRESS)]),
     );
@@ -484,6 +608,49 @@ fn initialize_on_chain_governance(session: &mut SessionExt, genesis_config: &Gen
             MoveValue::U64(genesis_config.voting_duration_secs),
         ]),
     );
+}
+
+fn initialize_keyless_accounts(session: &mut SessionExt, chain_id: ChainId) {
+    let config = keyless::Configuration::new_for_devnet();
+    exec_function(
+        session,
+        KEYLESS_ACCOUNT_MODULE_NAME,
+        "update_configuration",
+        vec![],
+        serialize_values(&vec![
+            MoveValue::Signer(CORE_CODE_ADDRESS),
+            config.as_move_value(),
+        ]),
+    );
+    if !chain_id.is_mainnet() {
+        let vk = Groth16VerificationKey::from(DEVNET_VERIFICATION_KEY.clone());
+        exec_function(
+            session,
+            KEYLESS_ACCOUNT_MODULE_NAME,
+            "update_groth16_verification_key",
+            vec![],
+            serialize_values(&vec![
+                MoveValue::Signer(CORE_CODE_ADDRESS),
+                vk.as_move_value(),
+            ]),
+        );
+
+        let patch: PatchJWKMoveStruct = PatchUpsertJWK {
+            issuer: get_sample_iss(),
+            jwk: RSA_JWK::secure_test_jwk().into(),
+        }
+        .into();
+        exec_function(
+            session,
+            JWKS_MODULE_NAME,
+            "set_patches",
+            vec![],
+            serialize_values(&vec![
+                MoveValue::Signer(CORE_CODE_ADDRESS),
+                MoveValue::Vector(vec![patch.as_move_value()]),
+            ]),
+        );
+    }
 }
 
 fn create_accounts(session: &mut SessionExt, accounts: &[AccountBalance]) {
@@ -621,17 +788,23 @@ fn emit_new_block_and_epoch_event(session: &mut SessionExt) {
 }
 
 /// Verify the consistency of the genesis `WriteSet`
-fn verify_genesis_write_set(events: &[ContractEvent]) {
-    let new_epoch_events: Vec<&ContractEvent> = events
+fn verify_genesis_write_set(events: &[(ContractEvent, Option<MoveTypeLayout>)]) {
+    let new_epoch_events: Vec<&ContractEventV1> = events
         .iter()
-        .filter(|e| e.key() == &NewEpochEvent::event_key())
+        .filter_map(|(e, _)| {
+            if e.event_key() == Some(&NewEpochEvent::event_key()) {
+                Some(e.v1().unwrap())
+            } else {
+                None
+            }
+        })
         .collect();
     assert_eq!(
         new_epoch_events.len(),
         1,
         "There should only be exactly one NewEpochEvent"
     );
-    assert_eq!(new_epoch_events[0].sequence_number(), 0,);
+    assert_eq!(new_epoch_events[0].sequence_number(), 0);
 }
 
 /// An enum specifying whether the compiled stdlib/scripts should be used or freshly built versions
@@ -729,7 +902,7 @@ impl TestValidator {
     fn gen(rng: &mut StdRng, initial_stake: Option<u64>) -> TestValidator {
         let key = Ed25519PrivateKey::generate(rng);
         let auth_key = AuthenticationKey::ed25519(&key.public_key());
-        let owner_address = auth_key.derived_address();
+        let owner_address = auth_key.account_address();
         let consensus_key = bls12381::PrivateKey::generate(rng);
         let consensus_pubkey = consensus_key.public_key().to_bytes().to_vec();
         let proof_of_possession = bls12381::ProofOfPossession::create(&consensus_key)
@@ -789,9 +962,12 @@ pub fn generate_test_genesis(
             voting_power_increase_limit: 50,
             employee_vesting_start: 1663456089,
             employee_vesting_period_duration: 5 * 60, // 5 minutes
+            initial_features_override: None,
+            randomness_config_override: None,
+            jwk_consensus_config_override: None,
         },
-        &OnChainConsensusConfig::default(),
-        &OnChainExecutionConfig::default(),
+        &OnChainConsensusConfig::default_for_genesis(),
+        &OnChainExecutionConfig::default_for_genesis(),
         &default_gas_schedule(),
     );
     (genesis, test_validators)
@@ -812,8 +988,8 @@ pub fn generate_mainnet_genesis(
         framework,
         ChainId::test(),
         &mainnet_genesis_config(),
-        &OnChainConsensusConfig::default(),
-        &OnChainExecutionConfig::default(),
+        &OnChainConsensusConfig::default_for_genesis(),
+        &OnChainExecutionConfig::default_for_genesis(),
         &default_gas_schedule(),
     );
     (genesis, test_validators)
@@ -836,6 +1012,9 @@ fn mainnet_genesis_config() -> GenesisConfiguration {
         voting_power_increase_limit: 30,
         employee_vesting_start: 1663456089,
         employee_vesting_period_duration: 5 * 60, // 5 minutes
+        initial_features_override: None,
+        randomness_config_override: None,
+        jwk_consensus_config_override: None,
     }
 }
 
@@ -876,15 +1055,17 @@ pub fn test_genesis_module_publishing() {
 
     let move_vm = MoveVmExt::new(
         NativeGasParameters::zeros(),
-        AbstractValueSizeGasParameters::zeros(),
+        MiscGasParameters::zeros(),
         LATEST_GAS_FEATURE_VERSION,
         ChainId::test().id(),
         Features::default(),
-        TimedFeatures::enable_all(),
+        TimedFeaturesBuilder::enable_all().build(),
+        &data_cache,
+        false,
     )
     .unwrap();
     let id1 = HashValue::zero();
-    let mut session = move_vm.new_session(&data_cache, SessionId::genesis(id1), true);
+    let mut session = move_vm.new_session(&data_cache, SessionId::genesis(id1));
     publish_framework(&mut session, aptos_cached_packages::head_release_bundle());
 }
 
@@ -892,7 +1073,7 @@ pub fn test_genesis_module_publishing() {
 pub fn test_mainnet_end_to_end() {
     use aptos_types::{
         account_address,
-        on_chain_config::{OnChainConfig, ValidatorSet},
+        on_chain_config::ValidatorSet,
         state_store::state_key::StateKey,
         write_set::{TransactionWrite, WriteSet},
     };
@@ -1097,8 +1278,7 @@ pub fn test_mainnet_end_to_end() {
 
     let WriteSet::V0(writeset) = changeset.write_set();
 
-    let state_key =
-        StateKey::access_path(ValidatorSet::access_path().expect("access path in test"));
+    let state_key = StateKey::on_chain_config::<ValidatorSet>();
     let bytes = writeset
         .get(&state_key)
         .unwrap()

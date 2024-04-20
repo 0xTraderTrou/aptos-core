@@ -18,6 +18,12 @@ module std::vector {
     /// The length of the vectors are not equal.
     const EVECTORS_LENGTH_MISMATCH: u64 = 0x20002;
 
+    /// The step provided in `range` is invalid, must be greater than zero.
+    const EINVALID_STEP: u64 = 0x20003;
+
+    /// The range in `slice` is invalid.
+    const EINVALID_SLICE_RANGE: u64 = 0x20004;
+
     #[bytecode_instruction]
     /// Create an empty vector.
     native public fun empty<Element>(): vector<Element>;
@@ -174,6 +180,26 @@ module std::vector {
     }
     spec index_of {
         pragma intrinsic = true;
+    }
+
+    /// Return `(true, i)` if there's an element that matches the predicate. If there are multiple elements that match
+    /// the predicate, only the index of the first one is returned.
+    /// Otherwise, returns `(false, 0)`.
+    public inline fun find<Element>(v: &vector<Element>, f: |&Element|bool): (bool, u64) {
+        let find = false;
+        let found_index = 0;
+        let i = 0;
+        let len = length(v);
+        while (i < len) {
+            // Cannot call return in an inline function so we need to resort to break here.
+            if (f(borrow(v, i))) {
+                find = true;
+                found_index = i;
+                break
+            };
+            i = i + 1;
+        };
+        (find, found_index)
     }
 
     /// Insert a new element at position 0 <= i <= length, using O(length - i) time.
@@ -567,6 +593,36 @@ module std::vector {
         d: |Element|
     ) {
         for_each_reverse(v, |e| d(e))
+    }
+
+    public fun range(start: u64, end: u64): vector<u64> {
+        range_with_step(start, end, 1)
+    }
+
+    public fun range_with_step(start: u64, end: u64, step: u64): vector<u64> {
+        assert!(step > 0, EINVALID_STEP);
+
+        let vec = vector[];
+        while (start < end) {
+            push_back(&mut vec, start);
+            start = start + step;
+        };
+        vec
+    }
+
+    public fun slice<Element: copy>(
+        v: &vector<Element>,
+        start: u64,
+        end: u64
+    ): vector<Element> {
+        assert!(start <= end && end <= length(v), EINVALID_SLICE_RANGE);
+
+        let vec = vector[];
+        while (start < end) {
+            push_back(&mut vec, *borrow(v, start));
+            start = start + 1;
+        };
+        vec
     }
 
     // =================================================================

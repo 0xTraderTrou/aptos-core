@@ -9,7 +9,7 @@ use crate::shared::{
 use move_command_line_common::files::FileHash;
 use move_ir_types::location::*;
 use move_symbol_pool::Symbol;
-use std::{fmt, hash::Hash};
+use std::{fmt, fmt::Formatter, hash::Hash};
 
 macro_rules! new_name {
     ($n:ident) => {
@@ -234,6 +234,35 @@ new_name!(FunctionName);
 pub const NATIVE_MODIFIER: &str = "native";
 pub const ENTRY_MODIFIER: &str = "entry";
 
+/// An access specifier describes the resources being accessed by a function.
+/// In contrast to regular `NameAccessChain`, the identifiers inside of the
+/// chain can be wildcards (`*`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AccessSpecifier_ {
+    Acquires(bool, NameAccessChain, Option<Vec<Type>>, AddressSpecifier),
+    Reads(bool, NameAccessChain, Option<Vec<Type>>, AddressSpecifier),
+    Writes(bool, NameAccessChain, Option<Vec<Type>>, AddressSpecifier),
+}
+
+pub type AccessSpecifier = Spanned<AccessSpecifier_>;
+
+/// An address specifier specifies the address at which a resource is accessed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AddressSpecifier_ {
+    /// Represents that no address was specified, as in `Resource`
+    Empty,
+    /// Represents that the specified address is a wildcard, as in `Resource(*)`.
+    Any,
+    /// Represents the precise address.
+    Literal(NumericalAddress),
+    /// Represents a parameter name.
+    Name(Name),
+    /// Represents a function applied to a parameter name.
+    Call(NameAccessChain, Option<Vec<Type>>, Name),
+}
+
+pub type AddressSpecifier = Spanned<AddressSpecifier_>;
+
 #[derive(PartialEq, Clone, Debug)]
 pub struct FunctionSignature {
     pub type_parameters: Vec<(Name, Vec<Ability>)>,
@@ -257,17 +286,15 @@ pub enum FunctionBody_ {
 pub type FunctionBody = Spanned<FunctionBody_>;
 
 #[derive(PartialEq, Debug, Clone)]
-// (public?) foo<T1(: copyable?), ..., TN(: copyable?)>(x1: t1, ..., xn: tn): t1 * ... * tn {
-//    body
-//  }
-// (public?) native foo<T1(: copyable?), ..., TN(: copyable?)>(x1: t1, ..., xn: tn): t1 * ... * tn;
 pub struct Function {
     pub attributes: Vec<Attributes>,
     pub loc: Loc,
     pub visibility: Visibility,
     pub entry: Option<Loc>,
     pub signature: FunctionSignature,
-    pub acquires: Vec<NameAccessChain>,
+    /// `None` indicates no specifiers given, `Some([])` indicates the `pure` keyword has been
+    /// used.
+    pub access_specifiers: Option<Vec<AccessSpecifier>>,
     pub name: FunctionName,
     pub inline: bool,
     pub body: FunctionBody,
@@ -559,6 +586,16 @@ pub enum QuantKind_ {
 }
 pub type QuantKind = Spanned<QuantKind_>;
 
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub enum CallKind {
+    /// Regular function call.
+    Regular,
+    /// Macro style call (e.g. `assert!(c, x)`)
+    Macro,
+    /// Receiver style call (e.g. `x.f(y)`)
+    Receiver,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum Exp_ {
@@ -572,7 +609,13 @@ pub enum Exp_ {
 
     // f(earg,*)
     // f!(earg,*)
-    Call(NameAccessChain, bool, Option<Vec<Type>>, Spanned<Vec<Exp>>),
+    // earg.f(*)
+    Call(
+        NameAccessChain,
+        CallKind,
+        Option<Vec<Type>>,
+        Spanned<Vec<Exp>>,
+    ),
 
     // tn {f1: e1, ... , f_n: e_n }
     Pack(NameAccessChain, Option<Vec<Type>>, Vec<(Field, Exp)>),
@@ -665,8 +708,8 @@ pub type Sequence = (
 pub enum SequenceItem_ {
     // e;
     Seq(Box<Exp>),
-    // let b : t = e;
-    // let b = e;
+    // let b : t;
+    // let b;
     Declare(BindList, Option<Type>),
     // let b : t = e;
     // let b = e;
@@ -962,6 +1005,15 @@ impl fmt::Display for Ability_ {
     }
 }
 
+impl fmt::Display for CallKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            CallKind::Regular => "",
+            CallKind::Macro => "!",
+            CallKind::Receiver => ".",
+        })
+    }
+}
 //**************************************************************************************************
 // Debug
 //**************************************************************************************************
@@ -1457,7 +1509,7 @@ impl AstDebug for Function {
             visibility,
             entry,
             signature,
-            acquires,
+            access_specifiers: _, // No one uses those dump functions, so skipping this...
             inline,
             name,
             body,
@@ -1476,11 +1528,6 @@ impl AstDebug for Function {
             w.write(&format!("fun {}", name));
         }
         signature.ast_debug(w);
-        if !acquires.is_empty() {
-            w.write(" acquires ");
-            w.comma(acquires, |w, m| w.write(&format!("{}", m)));
-            w.write(" ");
-        }
         match &body.value {
             FunctionBody_::Defined(body) => w.block(|w| body.ast_debug(w)),
             FunctionBody_::Native => w.writeln(";"),
@@ -1701,11 +1748,9 @@ impl AstDebug for Exp_ {
                     w.write(">");
                 }
             },
-            E::Call(ma, is_macro, tys_opt, sp!(_, rhs)) => {
+            E::Call(ma, kind, tys_opt, sp!(_, rhs)) => {
                 ma.ast_debug(w);
-                if *is_macro {
-                    w.write("!");
-                }
+                w.write(kind.to_string());
                 if let Some(ss) = tys_opt {
                     w.write("<");
                     ss.ast_debug(w);

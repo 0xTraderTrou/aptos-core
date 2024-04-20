@@ -2,26 +2,38 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use self::framework::FrameworkReleaseConfig;
-use crate::components::feature_flags::Features;
-use anyhow::{anyhow, bail, Result};
+use crate::{
+    aptos_core_path, aptos_framework_path,
+    components::{
+        feature_flags::Features, oidc_providers::OidcProviderOp,
+        randomness_config::ReleaseFriendlyRandomnessConfig,
+    },
+};
+use anyhow::{anyhow, bail, Context, Result};
 use aptos::governance::GenerateExecutionHash;
+use aptos_gas_schedule::LATEST_GAS_FEATURE_VERSION;
+use aptos_infallible::duration_since_epoch;
 use aptos_rest_client::Client;
 use aptos_temppath::TempPath;
 use aptos_types::{
     account_config::CORE_CODE_ADDRESS,
     on_chain_config::{
-        ExecutionConfigV1, GasScheduleV2, OnChainConfig, OnChainConsensusConfig,
-        OnChainExecutionConfig, TransactionShufflerType, Version,
+        AptosVersion, ExecutionConfigV1, FeatureFlag as AptosFeatureFlag, GasScheduleV2,
+        OnChainConfig, OnChainConsensusConfig, OnChainExecutionConfig, OnChainJWKConsensusConfig,
+        OnChainRandomnessConfig, RandomnessConfigMoveStruct, TransactionShufflerType,
     },
 };
 use futures::executor::block_on;
 use handlebars::Handlebars;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs::File,
     io::{Read, Write},
     path::{Path, PathBuf},
+    thread::sleep,
+    time::Duration,
 };
 use url::Url;
 
@@ -30,6 +42,9 @@ pub mod execution_config;
 pub mod feature_flags;
 pub mod framework;
 pub mod gas;
+pub mod jwk_consensus_config;
+pub mod oidc_providers;
+pub mod randomness_config;
 pub mod transaction_fee;
 pub mod version;
 
@@ -46,6 +61,39 @@ pub struct Proposal {
     pub metadata: ProposalMetadata,
     pub execution_mode: ExecutionMode,
     pub update_sequence: Vec<ReleaseEntry>,
+}
+
+impl Proposal {
+    fn consolidated_side_effects(&self) -> Vec<ReleaseEntry> {
+        let mut ret = vec![];
+        let mut features_diff = Features::empty();
+        for entry in &self.update_sequence {
+            match entry {
+                ReleaseEntry::FeatureFlag(feature_flags) => {
+                    features_diff.squash(feature_flags.clone())
+                },
+                ReleaseEntry::Framework(_)
+                | ReleaseEntry::CustomGas(_)
+                | ReleaseEntry::DefaultGas
+                | ReleaseEntry::DefaultGasWithOverride(_)
+                | ReleaseEntry::DefaultGasWithOverrideOld(_)
+                | ReleaseEntry::Version(_)
+                | ReleaseEntry::Consensus(_)
+                | ReleaseEntry::Execution(_)
+                | ReleaseEntry::JwkConsensus(_)
+                | ReleaseEntry::Randomness(_)
+                | ReleaseEntry::RawScript(_) => ret.push(entry.clone()),
+                // Deprecated by `JwkConsensus`.
+                ReleaseEntry::OidcProviderOps(_) => {},
+            }
+        }
+
+        if !features_diff.is_empty() {
+            ret.push(ReleaseEntry::FeatureFlag(features_diff));
+        }
+
+        ret
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -65,8 +113,19 @@ fn default_url() -> String {
 #[derive(Serialize, Deserialize, Clone, Copy, Eq, PartialEq)]
 pub enum ExecutionMode {
     MultiStep,
-    SingleStep,
     RootSigner,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
+pub struct GasOverrideConfig {
+    feature_version: Option<u64>,
+    overrides: Option<Vec<GasOverride>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
+pub struct GasOverride {
+    name: String,
+    value: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
@@ -74,11 +133,18 @@ pub enum ReleaseEntry {
     Framework(FrameworkReleaseConfig),
     CustomGas(GasScheduleV2),
     DefaultGas,
-    Version(Version),
+    DefaultGasWithOverride(GasOverrideConfig),
+    /// Only used before randomness framework upgrade.
+    DefaultGasWithOverrideOld(GasOverrideConfig),
+    Version(AptosVersion),
     FeatureFlag(Features),
     Consensus(OnChainConsensusConfig),
     Execution(OnChainExecutionConfig),
     RawScript(PathBuf),
+    /// Deprecated by `OnChainJwkConsensusConfig`.
+    OidcProviderOps(Vec<OidcProviderOp>),
+    JwkConsensus(OnChainJWKConsensusConfig),
+    Randomness(ReleaseFriendlyRandomnessConfig),
 }
 
 impl ReleaseEntry {
@@ -90,7 +156,6 @@ impl ReleaseEntry {
     ) -> Result<()> {
         let (is_testnet, is_multi_step) = match execution_mode {
             ExecutionMode::MultiStep => (false, true),
-            ExecutionMode::SingleStep => (false, false),
             ExecutionMode::RootSigner => (true, false),
         };
         match self {
@@ -111,6 +176,7 @@ impl ReleaseEntry {
             ReleaseEntry::CustomGas(gas_schedule) => {
                 if !fetch_and_equals::<GasScheduleV2>(client, gas_schedule)? {
                     result.append(&mut gas::generate_gas_upgrade_proposal(
+                        true,
                         gas_schedule,
                         is_testnet,
                         if is_multi_step {
@@ -122,9 +188,61 @@ impl ReleaseEntry {
                 }
             },
             ReleaseEntry::DefaultGas => {
-                let gas_schedule = aptos_gas::gen::current_gas_schedule();
+                let gas_schedule =
+                    aptos_gas_schedule_updator::current_gas_schedule(LATEST_GAS_FEATURE_VERSION);
                 if !fetch_and_equals::<GasScheduleV2>(client, &gas_schedule)? {
                     result.append(&mut gas::generate_gas_upgrade_proposal(
+                        true,
+                        &gas_schedule,
+                        is_testnet,
+                        if is_multi_step {
+                            get_execution_hash(result)
+                        } else {
+                            "".to_owned().into_bytes()
+                        },
+                    )?);
+                }
+            },
+            ReleaseEntry::DefaultGasWithOverride(GasOverrideConfig {
+                feature_version,
+                overrides,
+            }) => {
+                let feature_version = feature_version.unwrap_or(LATEST_GAS_FEATURE_VERSION);
+                let gas_schedule = gas_override_default(
+                    feature_version,
+                    overrides
+                        .as_ref()
+                        .map(|overrides| overrides.as_slice())
+                        .unwrap_or(&[]),
+                )?;
+                if !fetch_and_equals::<GasScheduleV2>(client, &gas_schedule)? {
+                    result.append(&mut gas::generate_gas_upgrade_proposal(
+                        true,
+                        &gas_schedule,
+                        is_testnet,
+                        if is_multi_step {
+                            get_execution_hash(result)
+                        } else {
+                            "".to_owned().into_bytes()
+                        },
+                    )?);
+                }
+            },
+            ReleaseEntry::DefaultGasWithOverrideOld(GasOverrideConfig {
+                feature_version,
+                overrides,
+            }) => {
+                let feature_version = feature_version.unwrap_or(LATEST_GAS_FEATURE_VERSION);
+                let gas_schedule = gas_override_default(
+                    feature_version,
+                    overrides
+                        .as_ref()
+                        .map(|overrides| overrides.as_slice())
+                        .unwrap_or(&[]),
+                )?;
+                if !fetch_and_equals::<GasScheduleV2>(client, &gas_schedule)? {
+                    result.append(&mut gas::generate_gas_upgrade_proposal(
+                        false,
                         &gas_schedule,
                         is_testnet,
                         if is_multi_step {
@@ -136,7 +254,7 @@ impl ReleaseEntry {
                 }
             },
             ReleaseEntry::Version(version) => {
-                if !fetch_and_equals::<Version>(client, version)? {
+                if !fetch_and_equals::<AptosVersion>(client, version)? {
                     result.append(&mut version::generate_version_upgrade_proposal(
                         version,
                         is_testnet,
@@ -204,9 +322,19 @@ impl ReleaseEntry {
                     );
                 }
             },
+            ReleaseEntry::OidcProviderOps(ops) => {
+                result.append(&mut oidc_providers::generate_oidc_provider_ops_proposal(
+                    ops,
+                    is_testnet,
+                    if is_multi_step {
+                        get_execution_hash(result)
+                    } else {
+                        "".to_owned().into_bytes()
+                    },
+                )?);
+            },
             ReleaseEntry::RawScript(script_path) => {
-                let base_path =
-                    PathBuf::from(std::env!("CARGO_MANIFEST_DIR")).join(script_path.as_path());
+                let base_path = aptos_core_path().join(script_path.as_path());
                 let file_name = base_path
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -214,7 +342,8 @@ impl ReleaseEntry {
                         anyhow!("Unable to obtain file name for proposal: {:?}", script_path)
                     })?
                     .to_string();
-                let file_content = std::fs::read_to_string(base_path)?;
+                let file_content = std::fs::read_to_string(base_path)
+                    .with_context(|| format!("Unable to read file: {}", script_path.display()))?;
 
                 if let ExecutionMode::MultiStep = execution_mode {
                     // Render the hash for multi step proposal.
@@ -245,6 +374,32 @@ impl ReleaseEntry {
                     result.push((file_name, file_content));
                 }
             },
+            ReleaseEntry::JwkConsensus(config) => {
+                result.append(
+                    &mut jwk_consensus_config::generate_jwk_consensus_config_update_proposal(
+                        config,
+                        is_testnet,
+                        if is_multi_step {
+                            get_execution_hash(result)
+                        } else {
+                            "".to_owned().into_bytes()
+                        },
+                    )?,
+                );
+            },
+            ReleaseEntry::Randomness(config) => {
+                result.append(
+                    &mut randomness_config::generate_randomness_config_update_proposal(
+                        config,
+                        is_testnet,
+                        if is_multi_step {
+                            get_execution_hash(result)
+                        } else {
+                            "".to_owned().into_bytes()
+                        },
+                    )?,
+                );
+            },
         }
         Ok(())
     }
@@ -255,17 +410,44 @@ impl ReleaseEntry {
             ReleaseEntry::Framework(_) => (),
             ReleaseEntry::RawScript(_) => (),
             ReleaseEntry::CustomGas(gas_schedule) => {
-                if !fetch_and_equals(client_opt, gas_schedule)? {
+                if !wait_until_equals(client_opt, gas_schedule, *MAX_ASYNC_RECONFIG_TIME) {
                     bail!("Gas schedule config mismatch: Expected {:?}", gas_schedule);
                 }
             },
             ReleaseEntry::DefaultGas => {
-                if !fetch_and_equals(client_opt, &aptos_gas::gen::current_gas_schedule())? {
+                if !wait_until_equals(
+                    client_opt,
+                    &aptos_gas_schedule_updator::current_gas_schedule(LATEST_GAS_FEATURE_VERSION),
+                    *MAX_ASYNC_RECONFIG_TIME,
+                ) {
+                    bail!("Gas schedule config mismatch: Expected Default");
+                }
+            },
+            ReleaseEntry::DefaultGasWithOverrideOld(config)
+            | ReleaseEntry::DefaultGasWithOverride(config) => {
+                let GasOverrideConfig {
+                    overrides,
+                    feature_version,
+                } = config;
+
+                let feature_version = feature_version.unwrap_or(LATEST_GAS_FEATURE_VERSION);
+
+                if !wait_until_equals(
+                    client_opt,
+                    &gas_override_default(
+                        feature_version,
+                        overrides
+                            .as_ref()
+                            .map(|overrides| overrides.as_slice())
+                            .unwrap_or(&[]),
+                    )?,
+                    Duration::from_secs(60),
+                ) {
                     bail!("Gas schedule config mismatch: Expected Default");
                 }
             },
             ReleaseEntry::Version(version) => {
-                if !fetch_and_equals(client_opt, version)? {
+                if !wait_until_equals(client_opt, version, Duration::from_secs(60)) {
                     bail!("Version config mismatch: Expected {:?}", version);
                 }
             },
@@ -278,27 +460,80 @@ impl ReleaseEntry {
                         )
                         .await
                 })?;
-                if features.has_modified(on_chain_features.inner()) {
-                    bail!(
-                        "Feature mismatch: Got {:?}, expected {:?}",
-                        on_chain_features.inner(),
-                        features
-                    );
+
+                for to_enable in &features.enabled {
+                    let flag = to_enable.clone().into();
+                    if !on_chain_features.inner().is_enabled(flag) {
+                        bail!(
+                            "Feature flag config mismatch: Expected {:?} to be enabled",
+                            to_enable
+                        );
+                    }
+                }
+
+                for to_disable in &features.disabled {
+                    let flag = to_disable.clone().into();
+                    if on_chain_features.inner().is_enabled(flag) {
+                        bail!(
+                            "Feature flag config mismatch: Expected {:?} to be disabled",
+                            to_disable
+                        );
+                    }
                 }
             },
             ReleaseEntry::Consensus(consensus_config) => {
-                if !fetch_and_equals(client_opt, consensus_config)? {
+                if !wait_until_equals(client_opt, consensus_config, *MAX_ASYNC_RECONFIG_TIME) {
                     bail!("Consensus config mismatch: Expected {:?}", consensus_config);
                 }
             },
             ReleaseEntry::Execution(execution_config) => {
-                if !fetch_and_equals(client_opt, execution_config)? {
+                if !wait_until_equals(client_opt, execution_config, *MAX_ASYNC_RECONFIG_TIME) {
                     bail!("Consensus config mismatch: Expected {:?}", execution_config);
+                }
+            },
+            ReleaseEntry::OidcProviderOps(_) => {},
+            ReleaseEntry::JwkConsensus(jwk_consensus_config) => {
+                if !wait_until_equals(client_opt, jwk_consensus_config, *MAX_ASYNC_RECONFIG_TIME) {
+                    bail!(
+                        "JWK consensus config mismatch: Expected {:?}",
+                        jwk_consensus_config
+                    );
+                }
+            },
+            ReleaseEntry::Randomness(config) => {
+                let expected_on_chain =
+                    RandomnessConfigMoveStruct::from(OnChainRandomnessConfig::from(config.clone()));
+                if !wait_until_equals(client_opt, &expected_on_chain, *MAX_ASYNC_RECONFIG_TIME) {
+                    bail!("randomness config mismatch: Expected {:?}", config);
                 }
             },
         }
         Ok(())
     }
+}
+
+fn gas_override_default(
+    feature_version: u64,
+    gas_overrides: &[GasOverride],
+) -> Result<GasScheduleV2> {
+    let mut gas_schedule = aptos_gas_schedule_updator::current_gas_schedule(feature_version);
+    for gas_override in gas_overrides {
+        let mut found = false;
+        for (name, value) in &mut gas_schedule.entries {
+            if name == &gas_override.name {
+                *value = gas_override.value;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            bail!(
+                "Gas override config mismatch: Expected {:?} to be in the gas schedule",
+                gas_override.name
+            );
+        }
+    }
+    Ok(gas_schedule)
 }
 
 // Compare the current on chain config with the value recorded on chain. Return false if there's a difference.
@@ -308,28 +543,47 @@ fn fetch_and_equals<T: OnChainConfig + PartialEq>(
 ) -> Result<bool> {
     match client {
         Some(client) => {
-            let config = T::deserialize_into_config(
-                block_on(async {
-                    client
-                        .get_account_resource_bytes(
-                            CORE_CODE_ADDRESS,
-                            format!(
-                                "{}::{}::{}",
-                                T::ADDRESS,
-                                T::MODULE_IDENTIFIER,
-                                T::TYPE_IDENTIFIER
-                            )
-                            .as_str(),
-                        )
-                        .await
-                })?
-                .inner(),
-            )?;
+            let config = fetch_config::<T>(client)?;
 
             Ok(&config == expected)
         },
         None => Ok(false),
     }
+}
+
+fn wait_until_equals<T: OnChainConfig + PartialEq>(
+    client: Option<&Client>,
+    expected: &T,
+    time_limit: Duration,
+) -> bool {
+    let deadline = duration_since_epoch() + time_limit;
+    while duration_since_epoch() < deadline {
+        if matches!(fetch_and_equals(client, expected), Ok(true)) {
+            return true;
+        }
+        sleep(Duration::from_secs(1));
+    }
+    false
+}
+
+pub fn fetch_config<T: OnChainConfig>(client: &Client) -> Result<T> {
+    T::deserialize_into_config(
+        block_on(async {
+            client
+                .get_account_resource_bytes(
+                    CORE_CODE_ADDRESS,
+                    format!(
+                        "{}::{}::{}",
+                        T::ADDRESS,
+                        T::MODULE_IDENTIFIER,
+                        T::TYPE_IDENTIFIER
+                    )
+                    .as_str(),
+                )
+                .await
+        })?
+        .inner(),
+    )
 }
 
 impl ReleaseConfig {
@@ -341,6 +595,19 @@ impl ReleaseConfig {
 
         // Create directories for source and metadata.
         let mut source_dir = base_path.to_path_buf();
+
+        // If source dir doesnt exist create it, if it does exist error
+        if !source_dir.exists() {
+            println!("Creating source directory: {:?}", source_dir);
+            std::fs::create_dir(source_dir.as_path()).map_err(|err| {
+                anyhow!(
+                    "Fail to create folder for source: {} {:?}",
+                    source_dir.display(),
+                    err
+                )
+            })?;
+        }
+
         source_dir.push("sources");
 
         std::fs::create_dir(source_dir.as_path())
@@ -453,12 +720,10 @@ impl ReleaseConfig {
     }
 
     // Fetch all configs from a remote rest endpoint and assert all the configs are the same as the ones specified locally.
-    pub fn validate_upgrade(&self, endpoint: Url) -> Result<()> {
-        let client = Client::new(endpoint);
-        for proposal in &self.proposals {
-            for entry in &proposal.update_sequence {
-                entry.validate_upgrade(&client)?;
-            }
+    pub fn validate_upgrade(&self, endpoint: &Url, proposal: &Proposal) -> Result<()> {
+        let client = Client::new(endpoint.clone());
+        for entry in proposal.consolidated_side_effects() {
+            entry.validate_upgrade(&client)?;
         }
         Ok(())
     }
@@ -470,14 +735,6 @@ impl Default for ReleaseConfig {
             name: "TestingConfig".to_string(),
             remote_endpoint: None,
             proposals: vec![
-                Proposal {
-                    execution_mode: ExecutionMode::SingleStep,
-                    metadata: ProposalMetadata::default(),
-                    name: "custom".to_string(),
-                    update_sequence: vec![ReleaseEntry::RawScript(PathBuf::from(
-                        "data/proposals/empty.move",
-                    ))],
-                },
                 Proposal {
                     execution_mode: ExecutionMode::MultiStep,
                     metadata: ProposalMetadata::default(),
@@ -499,7 +756,7 @@ impl Default for ReleaseConfig {
                     name: "feature_flags".to_string(),
                     update_sequence: vec![
                         ReleaseEntry::FeatureFlag(Features {
-                            enabled: aptos_vm_genesis::default_features()
+                            enabled: AptosFeatureFlag::default_features()
                                 .into_iter()
                                 .map(crate::components::feature_flags::FeatureFlag::from)
                                 .collect(),
@@ -507,7 +764,8 @@ impl Default for ReleaseConfig {
                         }),
                         ReleaseEntry::Consensus(OnChainConsensusConfig::default()),
                         ReleaseEntry::Execution(OnChainExecutionConfig::V1(ExecutionConfigV1 {
-                            transaction_shuffler_type: TransactionShufflerType::SenderAwareV1(32),
+                            transaction_shuffler_type:
+                                TransactionShufflerType::DeprecatedSenderAwareV1(32),
                         })),
                         ReleaseEntry::RawScript(PathBuf::from(
                             "data/proposals/empty_multi_step.move",
@@ -538,6 +796,7 @@ pub fn get_execution_hash(result: &Vec<(String, String)>) -> Vec<u8> {
 
         let (_, hash) = GenerateExecutionHash {
             script_path: Option::from(move_script_path),
+            framework_local_dir: Some(aptos_framework_path()),
         }
         .generate_hash()
         .unwrap();
@@ -562,6 +821,7 @@ fn append_script_hash(raw_script: String) -> String {
 
     let (_, hash) = GenerateExecutionHash {
         script_path: Option::from(move_script_path),
+        framework_local_dir: Some(aptos_framework_path()),
     }
     .generate_hash()
     .unwrap();
@@ -580,3 +840,14 @@ impl Default for ProposalMetadata {
         }
     }
 }
+
+fn get_signer_arg(is_testnet: bool, next_execution_hash: &Vec<u8>) -> &str {
+    if is_testnet && next_execution_hash.is_empty() {
+        "framework_signer"
+    } else {
+        "&framework_signer"
+    }
+}
+
+/// Estimated async reconfiguration time.
+static MAX_ASYNC_RECONFIG_TIME: Lazy<Duration> = Lazy::new(|| Duration::from_secs(60));

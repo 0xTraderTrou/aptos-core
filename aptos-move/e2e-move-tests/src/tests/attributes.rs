@@ -1,9 +1,9 @@
 // Copyright © Aptos Foundation
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{assert_success, assert_vm_status, MoveHarness};
+use crate::{assert_success, assert_vm_status, build_package, MoveHarness};
 use aptos_cached_packages::aptos_stdlib;
-use aptos_framework::{BuildOptions, BuiltPackage};
+use aptos_framework::BuildOptions;
 use aptos_package_builder::PackageBuilder;
 use aptos_types::{account_address::AccountAddress, on_chain_config::FeatureFlag};
 use move_binary_format::CompiledModule;
@@ -28,6 +28,66 @@ fn test_view_attribute() {
     );
     let path = builder.write_to_temp().unwrap();
     assert_success!(h.publish_package(&account, path.path()));
+}
+
+#[test]
+#[should_panic]
+fn test_view_attribute_with_signer() {
+    let mut h = MoveHarness::new();
+    let account = h.new_account_at(AccountAddress::from_hex_literal("0xf00d").unwrap());
+
+    let mut builder = PackageBuilder::new("Package");
+    builder.add_source(
+        "m.move",
+        r#"
+        module 0xf00d::M {
+            #[view]
+            fun view(_:signer,value: u64): u64 { value }
+        }
+        "#,
+    );
+    let path = builder.write_to_temp().unwrap();
+    h.create_publish_package(&account, path.path(), None, |_| {});
+}
+
+#[test]
+#[should_panic]
+fn test_view_attribute_with_ref_signer() {
+    let mut h = MoveHarness::new();
+    let account = h.new_account_at(AccountAddress::from_hex_literal("0xf00d").unwrap());
+
+    let mut builder = PackageBuilder::new("Package");
+    builder.add_source(
+        "m.move",
+        r#"
+        module 0xf00d::M {
+            #[view]
+            fun view(_:&signer,value: u64): u64 { value }
+        }
+        "#,
+    );
+    let path = builder.write_to_temp().unwrap();
+    h.create_publish_package(&account, path.path(), None, |_| {});
+}
+
+#[test]
+#[should_panic]
+fn test_view_attribute_with_mut_ref_signer() {
+    let mut h = MoveHarness::new();
+    let account = h.new_account_at(AccountAddress::from_hex_literal("0xf00d").unwrap());
+
+    let mut builder = PackageBuilder::new("Package");
+    builder.add_source(
+        "m.move",
+        r#"
+        module 0xf00d::M {
+            #[view]
+            fun view(_:&mut signer,value: u64): u64 { value }
+        }
+        "#,
+    );
+    let path = builder.write_to_temp().unwrap();
+    h.create_publish_package(&account, path.path(), None, |_| {});
 }
 
 #[test]
@@ -87,7 +147,7 @@ fn test_bad_fun_attribute_in_compiled_module() {
     );
     let path = builder.write_to_temp().unwrap();
 
-    let package = BuiltPackage::build(path.path().to_path_buf(), BuildOptions::default())
+    let package = build_package(path.path().to_path_buf(), BuildOptions::default())
         .expect("building package must succeed");
     let code = package.extract_code();
     // There should only be the above module
@@ -204,6 +264,29 @@ fn verify_resource_groups_fail_when_not_enabled() {
     assert_vm_status!(result, StatusCode::CONSTRAINT_NOT_SATISFIED);
 }
 
+#[test]
+fn verify_module_events_fail_when_not_enabled() {
+    let mut h = MoveHarness::new_with_features(vec![], vec![FeatureFlag::MODULE_EVENT]);
+    let account = h.new_account_at(AccountAddress::from_hex_literal("0xf00d").unwrap());
+    let source = r#"
+        module 0xf00d::M {
+            struct Event { }
+        }
+        "#;
+    let fake_attribute = FakeKnownAttribute {
+        kind: 4,
+        args: vec![],
+    };
+    let (code, metadata) =
+        build_package_and_insert_attribute(source, Some(("Event", fake_attribute)), None);
+    let result = h.run_transaction_payload(
+        &account,
+        aptos_stdlib::code_publish_package_txn(metadata, code),
+    );
+
+    assert_vm_status!(result, StatusCode::CONSTRAINT_NOT_SATISFIED);
+}
+
 fn build_package_and_insert_attribute(
     source: &str,
     struct_attr: Option<(&str, FakeKnownAttribute)>,
@@ -213,7 +296,7 @@ fn build_package_and_insert_attribute(
     builder.add_source("m.move", source);
     let path = builder.write_to_temp().unwrap();
 
-    let package = BuiltPackage::build(path.path().to_path_buf(), BuildOptions::default())
+    let package = build_package(path.path().to_path_buf(), BuildOptions::default())
         .expect("building package must succeed");
     let code = package.extract_code();
     // There should only be one module

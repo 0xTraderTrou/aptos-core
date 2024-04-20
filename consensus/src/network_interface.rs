@@ -4,12 +4,17 @@
 
 //! Interface between Consensus and Network layers.
 
-use crate::quorum_store::types::{Batch, BatchMsg, BatchRequest};
+use crate::{
+    dag::DAGNetworkMessage,
+    pipeline,
+    quorum_store::types::{Batch, BatchMsg, BatchRequest, BatchResponse},
+    rand::rand_gen::network_messages::RandGenMessage,
+};
 use aptos_config::network_id::{NetworkId, PeerNetworkId};
 use aptos_consensus_types::{
     block_retrieval::{BlockRetrievalRequest, BlockRetrievalResponse},
     epoch_retrieval::EpochRetrievalRequest,
-    experimental::{commit_decision::CommitDecision, commit_vote::CommitVote},
+    pipeline::{commit_decision::CommitDecision, commit_vote::CommitVote},
     proof_of_store::{ProofOfStoreMsg, SignedBatchInfoMsg},
     proposal_msg::ProposalMsg,
     sync_info::SyncInfo,
@@ -20,6 +25,7 @@ use aptos_network::{
     ProtocolId,
 };
 use aptos_types::{epoch_change::EpochChangeProof, PeerId};
+pub use pipeline::commit_reliable_broadcast::CommitMessage;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -61,8 +67,14 @@ pub enum ConsensusMsg {
     SignedBatchInfo(Box<SignedBatchInfoMsg>),
     /// Quorum Store: Broadcast a certified proof of store (a digest that received 2f+1 votes).
     ProofOfStoreMsg(Box<ProofOfStoreMsg>),
-    #[cfg(test)]
-    DAGTestMessage(Vec<u8>),
+    /// DAG protocol message
+    DAGMessage(DAGNetworkMessage),
+    /// Commit message
+    CommitMessage(Box<CommitMessage>),
+    /// Randomness generation message
+    RandGenMessage(RandGenMessage),
+    /// Quorum Store: Response to the batch request.
+    BatchResponseV2(Box<BatchResponse>),
 }
 
 /// Network type for consensus
@@ -85,8 +97,10 @@ impl ConsensusMsg {
             ConsensusMsg::BatchResponse(_) => "BatchResponse",
             ConsensusMsg::SignedBatchInfo(_) => "SignedBatchInfo",
             ConsensusMsg::ProofOfStoreMsg(_) => "ProofOfStoreMsg",
-            #[cfg(test)]
-            ConsensusMsg::DAGTestMessage(_) => "DAGTestMessage",
+            ConsensusMsg::DAGMessage(_) => "DAGMessage",
+            ConsensusMsg::CommitMessage(_) => "CommitMessage",
+            ConsensusMsg::RandGenMessage(_) => "RandGenMessage",
+            ConsensusMsg::BatchResponseV2(_) => "BatchResponseV2",
         }
     }
 }

@@ -4,7 +4,7 @@
 
 use crate::{
     accept_type::AcceptType,
-    context::Context,
+    context::{api_spawn_blocking, Context},
     failpoint::fail_point_poem,
     page::determine_limit,
     response::{
@@ -66,14 +66,13 @@ impl AccountsApi {
         fail_point_poem("endpoint_get_account")?;
         self.context
             .check_api_output_enabled("Get account", &accept_type)?;
-        let account = Account::new(
-            self.context.clone(),
-            address.0,
-            ledger_version.0,
-            None,
-            None,
-        )?;
-        account.account(&accept_type)
+
+        let context = self.context.clone();
+        api_spawn_blocking(move || {
+            let account = Account::new(context, address.0, ledger_version.0, None, None)?;
+            account.account(&accept_type)
+        })
+        .await
     }
 
     /// Get account resources
@@ -113,14 +112,19 @@ impl AccountsApi {
         fail_point_poem("endpoint_get_account_resources")?;
         self.context
             .check_api_output_enabled("Get account resources", &accept_type)?;
-        let account = Account::new(
-            self.context.clone(),
-            address.0,
-            ledger_version.0,
-            start.0.map(StateKey::from),
-            limit.0,
-        )?;
-        account.resources(&accept_type)
+
+        let context = self.context.clone();
+        api_spawn_blocking(move || {
+            let account = Account::new(
+                context,
+                address.0,
+                ledger_version.0,
+                start.0.map(StateKey::from),
+                limit.0,
+            )?;
+            account.resources(&accept_type)
+        })
+        .await
     }
 
     /// Get account modules
@@ -160,14 +164,19 @@ impl AccountsApi {
         fail_point_poem("endpoint_get_account_modules")?;
         self.context
             .check_api_output_enabled("Get account modules", &accept_type)?;
-        let account = Account::new(
-            self.context.clone(),
-            address.0,
-            ledger_version.0,
-            start.0.map(StateKey::from),
-            limit.0,
-        )?;
-        account.modules(&accept_type)
+
+        let context = self.context.clone();
+        api_spawn_blocking(move || {
+            let account = Account::new(
+                context,
+                address.0,
+                ledger_version.0,
+                start.0.map(StateKey::from),
+                limit.0,
+            )?;
+            account.modules(&accept_type)
+        })
+        .await
     }
 }
 
@@ -342,7 +351,10 @@ impl Account {
                     .latest_state_view_poem(&self.latest_ledger_info)?;
                 let converted_resources = state_view
                     .as_move_resolver()
-                    .as_converter(self.context.db.clone())
+                    .as_converter(
+                        self.context.db.clone(),
+                        self.context.table_info_reader.clone(),
+                    )
                     .try_into_resources(resources.iter().map(|(k, v)| (k.clone(), v.as_slice())))
                     .context("Failed to build move resource response from data in DB")
                     .map_err(|err| {
@@ -536,8 +548,11 @@ impl Account {
             })?;
 
         resolver
-            .as_converter(self.context.db.clone())
-            .move_struct_fields(resource_type, bytes.as_slice())
+            .as_converter(
+                self.context.db.clone(),
+                self.context.table_info_reader.clone(),
+            )
+            .move_struct_fields(resource_type, &bytes)
             .context("Failed to convert move structs from storage")
             .map_err(|err| {
                 BasicErrorWith404::internal_with_code(

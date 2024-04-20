@@ -195,7 +195,7 @@ async fn construction_derive(
 
     let public_key: Ed25519PublicKey =
         decode_key(&request.public_key.hex_bytes, "Ed25519PublicKey")?;
-    let address = AuthenticationKey::ed25519(&public_key).derived_address();
+    let address = AuthenticationKey::ed25519(&public_key).account_address();
 
     Ok(ConstructionDeriveResponse {
         account_identifier: AccountIdentifier::base_account(address),
@@ -500,7 +500,7 @@ async fn construction_parse(
         let mut account_identifier_signers: Vec<_> =
             vec![AccountIdentifier::base_account(signed_txn.sender())];
 
-        for account in signed_txn.authenticator().secondary_signer_addreses() {
+        for account in signed_txn.authenticator().secondary_signer_addresses() {
             account_identifier_signers.push(AccountIdentifier::base_account(account))
         }
 
@@ -552,6 +552,9 @@ async fn construction_parse(
                 ) => parse_create_stake_pool_operation(sender, &type_args, &args)?,
                 (AccountAddress::ONE, STAKING_CONTRACT_MODULE, RESET_LOCKUP_FUNCTION) => {
                     parse_reset_lockup_operation(sender, &type_args, &args)?
+                },
+                (AccountAddress::ONE, STAKING_CONTRACT_MODULE, UPDATE_COMMISSION_FUNCTION) => {
+                    parse_update_commission_operation(sender, &type_args, &args)?
                 },
                 (AccountAddress::ONE, STAKING_CONTRACT_MODULE, UNLOCK_STAKE_FUNCTION) => {
                     parse_unlock_stake_operation(sender, &type_args, &args)?
@@ -874,6 +877,30 @@ pub fn parse_unlock_stake_operation(
     )])
 }
 
+pub fn parse_update_commission_operation(
+    sender: AccountAddress,
+    type_args: &[TypeTag],
+    args: &[Vec<u8>],
+) -> ApiResult<Vec<Operation>> {
+    if !type_args.is_empty() {
+        return Err(ApiError::TransactionParseError(Some(format!(
+            "Unlock stake should not have type arguments: {:?}",
+            type_args
+        ))));
+    }
+
+    let operator: AccountAddress = parse_function_arg("update_commision", args, 0)?;
+    let new_commission_percentage: u64 = parse_function_arg("update_commision", args, 1)?;
+
+    Ok(vec![Operation::update_commission(
+        0,
+        None,
+        sender,
+        Some(AccountIdentifier::base_account(operator)),
+        Some(new_commission_percentage),
+    )])
+}
+
 pub fn parse_distribute_staking_rewards_operation(
     sender: AccountAddress,
     type_args: &[TypeTag],
@@ -1082,6 +1109,23 @@ async fn construction_payloads(
             } else {
                 return Err(ApiError::InvalidInput(Some(format!(
                     "Unlock stake operation doesn't match metadata {:?} vs {:?}",
+                    inner, metadata.internal_operation
+                ))));
+            }
+        },
+        InternalOperation::UpdateCommission(inner) => {
+            if let InternalOperation::UpdateCommission(ref metadata_op) =
+                metadata.internal_operation
+            {
+                if inner.owner != metadata_op.owner || inner.operator != metadata_op.operator {
+                    return Err(ApiError::InvalidInput(Some(format!(
+                        "Update commission operation doesn't match metadata {:?} vs {:?}",
+                        inner, metadata.internal_operation
+                    ))));
+                }
+            } else {
+                return Err(ApiError::InvalidInput(Some(format!(
+                    "Update commission operation doesn't match metadata {:?} vs {:?}",
                     inner, metadata.internal_operation
                 ))));
             }

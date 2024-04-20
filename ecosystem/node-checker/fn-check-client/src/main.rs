@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
         for node_result in node_results {
             nhc_responses
                 .entry(account_address)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(node_result);
         }
     }
@@ -137,4 +137,10 @@ async fn main() -> Result<()> {
 
     info!("Done!");
     Ok(())
+}
+
+#[test]
+fn verify_tool() {
+    use clap::CommandFactory;
+    Args::command().debug_assert()
 }

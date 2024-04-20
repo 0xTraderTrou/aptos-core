@@ -1,5 +1,8 @@
 // Copyright © Aptos Foundation
 // SPDX-License-Identifier: Apache-2.0
 
-pub mod metrics;
-pub mod service;
+mod config;
+mod metrics;
+mod service;
+
+pub use config::{IndexerGrpcDataServiceConfig, NonTlsConfig, SERVER_NAME};

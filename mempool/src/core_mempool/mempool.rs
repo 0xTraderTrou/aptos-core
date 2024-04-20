@@ -15,7 +15,7 @@ use crate::{
     shared_mempool::types::MultiBucketTimelineIndexIds,
 };
 use aptos_config::config::NodeConfig;
-use aptos_consensus_types::common::TransactionInProgress;
+use aptos_consensus_types::common::{TransactionInProgress, TransactionSummary};
 use aptos_crypto::HashValue;
 use aptos_logger::prelude::*;
 use aptos_types::{
@@ -25,8 +25,9 @@ use aptos_types::{
     vm_status::DiscardedVMStatus,
 };
 use std::{
-    collections::{HashMap, HashSet},
-    time::{Duration, SystemTime},
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::atomic::Ordering,
+    time::{Duration, Instant, SystemTime},
 };
 
 pub struct Mempool {
@@ -48,11 +49,21 @@ impl Mempool {
 
     /// This function will be called once the transaction has been stored.
     pub(crate) fn commit_transaction(&mut self, sender: &AccountAddress, sequence_number: u64) {
+        self.transactions
+            .commit_transaction(sender, sequence_number);
+    }
+
+    pub(crate) fn log_commit_transaction(
+        &self,
+        sender: &AccountAddress,
+        sequence_number: u64,
+        block_timestamp: Duration,
+    ) {
         trace!(
             LogSchema::new(LogEntry::RemoveTxn).txns(TxnsLog::new_txn(*sender, sequence_number)),
             is_rejected = false
         );
-        self.log_latency(*sender, sequence_number, counters::COMMIT_ACCEPTED_LABEL);
+        self.log_commit_latency(*sender, sequence_number, block_timestamp);
         if let Some(ranking_score) = self.transactions.get_ranking_score(sender, sequence_number) {
             counters::core_mempool_txn_ranking_score(
                 counters::REMOVE_LABEL,
@@ -61,9 +72,6 @@ impl Mempool {
                 ranking_score,
             );
         }
-
-        self.transactions
-            .commit_transaction(sender, sequence_number);
     }
 
     fn log_reject_transaction(
@@ -77,7 +85,7 @@ impl Mempool {
             is_rejected = true,
             label = reason_label,
         );
-        self.log_latency(*sender, sequence_number, reason_label);
+        self.log_commit_rejected_latency(*sender, sequence_number, reason_label);
         if let Some(ranking_score) = self.transactions.get_ranking_score(sender, sequence_number) {
             counters::core_mempool_txn_ranking_score(
                 counters::REMOVE_LABEL,
@@ -111,8 +119,8 @@ impl Mempool {
             .reject_transaction(sender, sequence_number, hash);
     }
 
-    pub(crate) fn log_txn_commit_latency(
-        insertion_info: InsertionInfo,
+    pub(crate) fn log_txn_latency(
+        insertion_info: &InsertionInfo,
         bucket: &str,
         stage: &'static str,
     ) {
@@ -126,12 +134,87 @@ impl Mempool {
         }
     }
 
-    fn log_latency(&self, account: AccountAddress, sequence_number: u64, stage: &'static str) {
-        if let Some((&insertion_info, bucket)) = self
+    fn log_consensus_pulled_latency(&self, account: AccountAddress, sequence_number: u64) {
+        if let Some((insertion_info, bucket)) = self
             .transactions
             .get_insertion_info_and_bucket(&account, sequence_number)
         {
-            Self::log_txn_commit_latency(insertion_info, bucket, stage);
+            let prev_count = insertion_info
+                .consensus_pulled_counter
+                .fetch_add(1, Ordering::Relaxed);
+            Self::log_txn_latency(insertion_info, bucket, counters::CONSENSUS_PULLED_LABEL);
+            counters::CORE_MEMPOOL_TXN_CONSENSUS_PULLED.observe((prev_count + 1) as f64);
+        }
+    }
+
+    fn log_commit_rejected_latency(
+        &self,
+        account: AccountAddress,
+        sequence_number: u64,
+        stage: &'static str,
+    ) {
+        if let Some((insertion_info, bucket)) = self
+            .transactions
+            .get_insertion_info_and_bucket(&account, sequence_number)
+        {
+            Self::log_txn_latency(insertion_info, bucket, stage);
+        }
+    }
+
+    fn log_commit_and_parked_latency(insertion_info: &InsertionInfo, bucket: &str) {
+        let parked_duration = if let Some(park_time) = insertion_info.park_time {
+            let parked_duration = insertion_info
+                .ready_time
+                .duration_since(park_time)
+                .unwrap_or(Duration::ZERO);
+            counters::core_mempool_txn_commit_latency(
+                counters::PARKED_TIME_LABEL,
+                insertion_info.submitted_by_label(),
+                bucket,
+                parked_duration,
+            );
+            parked_duration
+        } else {
+            Duration::ZERO
+        };
+
+        if let Ok(commit_duration) = SystemTime::now().duration_since(insertion_info.insertion_time)
+        {
+            let commit_minus_parked = commit_duration
+                .checked_sub(parked_duration)
+                .unwrap_or(Duration::ZERO);
+            counters::core_mempool_txn_commit_latency(
+                counters::NON_PARKED_COMMIT_ACCEPTED_LABEL,
+                insertion_info.submitted_by_label(),
+                bucket,
+                commit_minus_parked,
+            );
+        }
+    }
+
+    fn log_commit_latency(
+        &self,
+        account: AccountAddress,
+        sequence_number: u64,
+        block_timestamp: Duration,
+    ) {
+        if let Some((insertion_info, bucket)) = self
+            .transactions
+            .get_insertion_info_and_bucket(&account, sequence_number)
+        {
+            Self::log_txn_latency(insertion_info, bucket, counters::COMMIT_ACCEPTED_LABEL);
+            Self::log_commit_and_parked_latency(insertion_info, bucket);
+
+            let insertion_timestamp =
+                aptos_infallible::duration_since_epoch_at(&insertion_info.insertion_time);
+            if let Some(insertion_to_block) = block_timestamp.checked_sub(insertion_timestamp) {
+                counters::core_mempool_txn_commit_latency(
+                    counters::COMMIT_ACCEPTED_BLOCK_LABEL,
+                    insertion_info.submitted_by_label(),
+                    bucket,
+                    insertion_to_block,
+                );
+            }
         }
     }
 
@@ -188,6 +271,16 @@ impl Mempool {
         status
     }
 
+    fn was_seen(
+        txn_pointer: &TransactionSummary,
+        seen: &HashMap<TransactionSummary, u64>,
+        upgraded: &HashSet<&TransactionSummary>,
+        exclude_transactions: &BTreeMap<TransactionSummary, TransactionInProgress>,
+    ) -> bool {
+        seen.contains_key(txn_pointer)
+            || (!upgraded.contains(txn_pointer) && exclude_transactions.get(txn_pointer).is_some())
+    }
+
     /// Fetches next block of transactions for consensus.
     /// `return_non_full` - if false, only return transactions when max_txns or max_bytes is reached
     ///                     Should always be true for Quorum Store.
@@ -202,30 +295,23 @@ impl Mempool {
         max_bytes: u64,
         return_non_full: bool,
         include_gas_upgraded: bool,
-        mut exclude_transactions: Vec<TransactionInProgress>,
+        exclude_transactions: BTreeMap<TransactionSummary, TransactionInProgress>,
     ) -> Vec<SignedTransaction> {
-        // Sort, so per TxnPointer the highest gas will be in the map
-        if include_gas_upgraded {
-            exclude_transactions.sort();
-        }
-        let mut seen: HashMap<TxnPointer, u64> = exclude_transactions
-            .iter()
-            .map(|txn| (txn.summary, txn.gas_unit_price))
-            .collect();
+        let start_time = Instant::now();
+        let exclude_size = exclude_transactions.len();
+        let mut seen = HashMap::new();
+        let mut upgraded = HashSet::new();
         // Do not exclude transactions that had a gas upgrade
         if include_gas_upgraded {
-            let mut seen_and_upgraded = vec![];
             for (txn_pointer, new_gas) in self.transactions.get_gas_upgraded_txns() {
-                if let Some(gas) = seen.get(txn_pointer) {
-                    if *new_gas > *gas {
-                        seen_and_upgraded.push(txn_pointer);
+                if let Some(txn_info) = exclude_transactions.get(txn_pointer) {
+                    if *new_gas > txn_info.gas_unit_price() {
+                        upgraded.insert(txn_pointer);
                     }
                 }
             }
-            for txn_pointer in seen_and_upgraded {
-                seen.remove(txn_pointer);
-            }
         }
+        let gas_end_time = start_time.elapsed();
 
         let mut result = vec![];
         // Helper DS. Helps to mitigate scenarios where account submits several transactions
@@ -236,21 +322,30 @@ impl Mempool {
         // `skipped` DS and rechecked once it's ancestor becomes available
         let mut skipped = HashSet::new();
         let mut total_bytes = 0;
-        let seen_size = seen.len();
         let mut txn_walked = 0usize;
         // iterate over the queue of transactions based on gas price
         'main: for txn in self.transactions.iter_queue() {
             txn_walked += 1;
-            if seen.contains_key(&TxnPointer::from(txn)) {
+            if Self::was_seen(
+                &TxnPointer::from(txn),
+                &seen,
+                &upgraded,
+                &exclude_transactions,
+            ) {
                 continue;
             }
             let tx_seq = txn.sequence_number.transaction_sequence_number;
             let account_sequence_number = self.transactions.get_sequence_number(&txn.address);
-            let seen_previous =
-                tx_seq > 0 && seen.contains_key(&TxnPointer::new(txn.address, tx_seq - 1));
+            let previous_txn_was_seen = tx_seq > 0
+                && Self::was_seen(
+                    &TxnPointer::new(txn.address, tx_seq - 1),
+                    &seen,
+                    &upgraded,
+                    &exclude_transactions,
+                );
             // include transaction if it's "next" for given account or
             // we've already sent its ancestor to Consensus.
-            if seen_previous || account_sequence_number == Some(&tx_seq) {
+            if previous_txn_was_seen || account_sequence_number == Some(&tx_seq) {
                 let ptr = TxnPointer::from(txn);
                 seen.insert(ptr, txn.gas_ranking_score);
                 result.push(ptr);
@@ -274,6 +369,9 @@ impl Mempool {
             }
         }
         let result_size = result.len();
+        let result_end_time = start_time.elapsed();
+        let result_time = result_end_time.saturating_sub(gas_end_time);
+
         let mut block = Vec::with_capacity(result_size);
         let mut full_bytes = false;
         for txn_pointer in result {
@@ -281,13 +379,16 @@ impl Mempool {
                 .transactions
                 .get_with_ranking_score(&txn_pointer.sender, txn_pointer.sequence_number)
             {
-                let txn_size = txn.raw_txn_bytes_len();
-                if total_bytes + txn_size > max_bytes as usize {
+                let txn_size = txn.txn_bytes_len() as u64;
+                if total_bytes + txn_size > max_bytes {
                     full_bytes = true;
                     break;
                 }
                 total_bytes += txn_size;
                 block.push(txn);
+                if total_bytes == max_bytes {
+                    full_bytes = true;
+                }
                 counters::core_mempool_txn_ranking_score(
                     counters::CONSENSUS_PULLED_LABEL,
                     counters::CONSENSUS_PULLED_LABEL,
@@ -296,11 +397,13 @@ impl Mempool {
                 );
             }
         }
+        let block_end_time = start_time.elapsed();
+        let block_time = block_end_time.saturating_sub(result_end_time);
 
         if result_size > 0 {
             debug!(
                 LogSchema::new(LogEntry::GetBlock),
-                seen_consensus = seen_size,
+                seen_consensus = exclude_size,
                 walked = txn_walked,
                 seen_after = seen.len(),
                 // before size and non full check
@@ -309,19 +412,28 @@ impl Mempool {
                 byte_size = total_bytes,
                 block_size = block.len(),
                 return_non_full = return_non_full,
+                gas_time_ms = gas_end_time.as_millis(),
+                result_time_ms = result_time.as_millis(),
+                block_time_ms = block_time.as_millis(),
             );
         } else {
-            trace!(
-                LogSchema::new(LogEntry::GetBlock),
-                seen_consensus = seen_size,
-                walked = txn_walked,
-                seen_after = seen.len(),
-                // before size and non full check
-                result_size = result_size,
-                // before non full check
-                byte_size = total_bytes,
-                block_size = block.len(),
-                return_non_full = return_non_full,
+            sample!(
+                SampleRate::Duration(Duration::from_secs(60)),
+                debug!(
+                    LogSchema::new(LogEntry::GetBlock),
+                    seen_consensus = exclude_size,
+                    walked = txn_walked,
+                    seen_after = seen.len(),
+                    // before size and non full check
+                    result_size = result_size,
+                    // before non full check
+                    byte_size = total_bytes,
+                    block_size = block.len(),
+                    return_non_full = return_non_full,
+                    gas_time_ms = gas_end_time.as_millis(),
+                    result_time_ms = result_time.as_millis(),
+                    block_time_ms = block_time.as_millis(),
+                )
             );
         }
 
@@ -332,11 +444,7 @@ impl Mempool {
         counters::mempool_service_transactions(counters::GET_BLOCK_LABEL, block.len());
         counters::MEMPOOL_SERVICE_BYTES_GET_BLOCK.observe(total_bytes as f64);
         for transaction in &block {
-            self.log_latency(
-                transaction.sender(),
-                transaction.sequence_number(),
-                counters::CONSENSUS_PULLED_LABEL,
-            );
+            self.log_consensus_pulled_latency(transaction.sender(), transaction.sequence_number());
         }
         block
     }

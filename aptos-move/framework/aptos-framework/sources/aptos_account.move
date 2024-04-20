@@ -3,7 +3,7 @@ module aptos_framework::aptos_account {
     use aptos_framework::aptos_coin::AptosCoin;
     use aptos_framework::coin::{Self, Coin};
     use aptos_framework::create_signer::create_signer;
-    use aptos_framework::event::{EventHandle, emit_event};
+    use aptos_framework::event::{EventHandle, emit_event, emit};
     use std::error;
     use std::signer;
     use std::vector;
@@ -32,6 +32,12 @@ module aptos_framework::aptos_account {
 
     /// Event emitted when an account's direct coins transfer config is updated.
     struct DirectCoinTransferConfigUpdatedEvent has drop, store {
+        new_allow_direct_transfers: bool,
+    }
+
+    #[event]
+    struct DirectCoinTransferConfigUpdated has drop, store {
+        account: address,
         new_allow_direct_transfers: bool,
     }
 
@@ -75,12 +81,6 @@ module aptos_framework::aptos_account {
     /// Batch version of transfer_coins.
     public entry fun batch_transfer_coins<CoinType>(
         from: &signer, recipients: vector<address>, amounts: vector<u64>) acquires DirectTransferConfig {
-        spec {
-        // Cointype should not be aptoscoin, otherwise it will automaticly create an account.
-        // Meanwhile, aptoscoin has already been proved in normal tranfer
-        use aptos_std::type_info;
-        assume type_info::type_of<CoinType>() != type_info::type_of<AptosCoin>();
-        };
         let recipients_len = vector::length(&recipients);
         assert!(
             recipients_len == vector::length(&amounts),
@@ -96,26 +96,19 @@ module aptos_framework::aptos_account {
     /// Convenient function to transfer a custom CoinType to a recipient account that might not exist.
     /// This would create the recipient account first and register it to receive the CoinType, before transferring.
     public entry fun transfer_coins<CoinType>(from: &signer, to: address, amount: u64) acquires DirectTransferConfig {
-        spec {
-        // Cointype should not be aptoscoin, otherwise it will automaticly create an account.
-        // Meanwhile, aptoscoin has already been proved in normal tranfer
-        use aptos_std::type_info;
-        assume type_info::type_of<CoinType>() != type_info::type_of<AptosCoin>();
-        };
         deposit_coins(to, coin::withdraw<CoinType>(from, amount));
     }
 
     /// Convenient function to deposit a custom CoinType into a recipient account that might not exist.
     /// This would create the recipient account first and register it to receive the CoinType, before transferring.
     public fun deposit_coins<CoinType>(to: address, coins: Coin<CoinType>) acquires DirectTransferConfig {
-        spec {
-        // Cointype should not be aptoscoin, otherwise it will automaticly create an account.
-        // Meanwhile, aptoscoin has already been proved in normal tranfer
-        use aptos_std::type_info;
-        assume type_info::type_of<CoinType>() != type_info::type_of<AptosCoin>();
-        };
         if (!account::exists_at(to)) {
             create_account(to);
+            spec {
+                assert coin::is_account_registered<AptosCoin>(to);
+                assume aptos_std::type_info::type_of<CoinType>() == aptos_std::type_info::type_of<AptosCoin>() ==>
+                    coin::is_account_registered<CoinType>(to);
+            };
         };
         if (!coin::is_account_registered<CoinType>(to)) {
             assert!(
@@ -147,6 +140,10 @@ module aptos_framework::aptos_account {
             };
 
             direct_transfer_config.allow_arbitrary_coin_transfers = allow;
+
+            if (std::features::module_event_migration_enabled()) {
+                emit(DirectCoinTransferConfigUpdated { account: addr, new_allow_direct_transfers: allow });
+            };
             emit_event(
                 &mut direct_transfer_config.update_coin_transfer_events,
                 DirectCoinTransferConfigUpdatedEvent { new_allow_direct_transfers: allow });
@@ -154,6 +151,9 @@ module aptos_framework::aptos_account {
             let direct_transfer_config = DirectTransferConfig {
                 allow_arbitrary_coin_transfers: allow,
                 update_coin_transfer_events: new_event_handle<DirectCoinTransferConfigUpdatedEvent>(account),
+            };
+            if (std::features::module_event_migration_enabled()) {
+                emit(DirectCoinTransferConfigUpdated { account: addr, new_allow_direct_transfers: allow });
             };
             emit_event(
                 &mut direct_transfer_config.update_coin_transfer_events,

@@ -2,14 +2,118 @@
 
 All notable changes to the Aptos CLI will be captured in this file. This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and the format set out by [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## In Progress
+## Unreleased
+- Renamed `run-local-testnet` to `run-localnet`. `run-local-testnet` is still supported for backwards compatibility.
+
+## [3.1.0] - 2024/03/21
+- Update `self_update` dependency to support situations where relevant directories (e.g. `/tmp`) exist on different filesystems.
+- [bugfix] Rename `--value` back to `--override-size-check` for publishing packages
+- Upgraded indexer processors for localnet from cc764f83e26aed1d83ccad0cee3ab579792a0538. This adds support for the `TransactionMetadataProcessor` among other improvements.
+
+## [3.0.2] - 2024/03/12
+- Increased `max_connections` for postgres container created as part of localnet to address occasional startup failures due to overloaded DB.
+
+## [3.0.1] - 2024/03/05
+- Fix bug in `aptos update revela` if default install directory doesn't exist.
+
+## [3.0.0] - 2024/03/05
+- **Breaking Change**: `aptos update` is now `aptos update aptos`.
+- Added `aptos update revela`. This installs / updates the `revela` binary, which is needed for the new `aptos move decompile` subcommand.
+- Extended `aptos move download` with an option `--bytecode` to also download the bytecode of a module
+- Integrated the Revela decompiler which is now available via `aptos move decompile`
+- Extended `aptos move disassemble` and the new `aptos move decompile` to also work on entire packages instead of only single files
+
+## [2.5.0] - 2024/02/27
+- Updated CLI source compilation to use rust toolchain version 1.75.0 (from 1.74.1).
+- Upgraded indexer processors for localnet from 9936ec73cef251fb01fd2c47412e064cad3975c2 to d44b2d209f57872ac593299c34751a5531b51352. Upgraded Hasura metadata accordingly.
+- Added support for objects processor in localnet and enabled it by default.
+
+## [2.4.0] - 2024/01/05
+- Hide the V2 compiler from input options until the V2 compiler is ready for release
+- Updated CLI source compilation to use rust toolchain version 1.74.1 (from 1.72.1).
+- Added `for` loop.
+  - Syntax: `for (iter in lower_bound..upper_bound) { loop_body }` with integer bounds.
+  - Documentation: https://aptos.dev/move/book/loops
+- Upgraded indexer processors for localnet from 2d5cb211a89a8705674e9e1e741c841dd899c558 to 4801acae7aea30d7e96bbfbe5ec5b04056dfa4cf. Upgraded Hasura metadata accordingly.
+- Upgraded Hasura GraphQL engine image from 2.35.0 to 2.36.1.
+
+## [2.3.2] - 2023/11/28
+- Services in the localnet now bind to 127.0.0.1 by default (unless the CLI is running inside a container, which most users should not do) rather than 0.0.0.0. You can override this behavior with the `--bind-to` flag. This fixes an issue preventing the localnet from working on Windows.
+
+## [2.3.1] - 2023/11/07
+### Updated
+- Updated processor code from https://github.com/aptos-labs/aptos-indexer-processors for the localnet to 2d5cb211a89a8705674e9e1e741c841dd899c558.
+- Improved reliability of inter-container networking with localnet.
+
+## [2.3.0] - 2023/10/25
+### Added
+- Added `--node-api-key`. This lets you set an API key for the purpose of not being ratelimited.
+
+### Updated
+- Made the localnet exit more quickly if a service fails to start.
+- Updated processor code from https://github.com/aptos-labs/aptos-indexer-processors for the localnet to bcba94c26c8a6372056d2b69ce411c5719f98965.
+
+### Fixed
+- Fixed an infrequent bug that caused startup failures for the localnet with `--force-restart` + `--with-indexer-api` by using a Docker volume rather than a bind mount for the postgres storage.
+- Fixed an issue where the CLI could not find the Docker socket with some Docker Desktop configurations.
+
+## [2.2.2] - 2023/10/16
+### Updated
+- Updated processor code from https://github.com/aptos-labs/aptos-indexer-processors for the localnet to d6f55d4baba32960ea7be60878552e73ffbe8b7e.
+
+## [2.2.1] - 2023/10/13
+### Fixed
+- Fixed postgres data persistence between restarts when using `aptos node run-local-testnet --with-indexer-api`.
+
+## [2.2.0] - 2023/10/11
+### Added
+- Added `--with-indexer-api` to `aptos node run-local-testnet`. With this flag you can run a full processor + indexer API stack as part of your localnet. You must have Docker installed to use this feature. For more information, see https://aptos.dev/nodes/local-testnet/local-testnet-index.
+### Updated
+- Updated CLI source compilation to use rust toolchain version 1.72.1 (from 1.71.1).
+
+## [2.1.1] - 2023/09/27
+### Added
+- Added an option `--print-metadata` to the command `aptos move download` to print out the metadata of the package to be downloaded.
+  - Example: `aptos move download  --account 0x1 --package AptosFramework --url https://mainnet.aptoslabs.com/v1 --print-metadata`
+### Updated
+- The `--with-faucet` flag has been removed from `aptos node run-local-testnet`, we now run a faucet by default. To disable the faucet use the `--no-faucet` flag.
+- **Breaking change**: When using `aptos node run-local-testnet` we now expose a transaction stream. Learn more about the transaction stream service here: https://aptos.dev/indexer/txn-stream/. Opt out of this with `--no-txn-stream`. This is marked as a breaking change since the CLI now uses a port (50051 by default) that it didn't used to. If you need this port, you can tell the CLI to use a different port with `--txn-stream-port`.
+
+## [2.1.0] - 2023/08/24
+### Updated
+- Updated CLI source compilation to use rust toolchain version 1.71.1 (from 1.71.0).
+### Added
+- Added basic ledger support for CLI
+  - Example: `aptos init --ledger` to create a new profile from ledger. After this, you can use it the same way as other profiles.
+  - Note: `Ledger Nano s Plus` or `Ledger Nano X` is highly recommended.
+
+## [2.0.3] - 2023/08/04
+### Fixed
+- Fixed the following input arguments issue when running `aptos move view`
+  - #8513: Fixed issue where CLI does not work with big numbers
+  - #8982: Fixed args issue when passing in u64/u128/u256 parameters
+### Update
+- CLI documentation refactor
+- Updated CLI source compilation to use rust toolchain version 1.71.0 (from 1.70.0).
+### Fixed
+* Verify package now does not fail on a mismatched upgrade number
+
+## [2.0.2] - 2023/07/06
 ### Added
 - Added account lookup by authentication key
   - Example: `account lookup-address --auth-key {your_auth_key}`
+### Updated
+- Updated CLI source compilation to use rust toolchain version 1.70.0 (from 1.66.1).
+- Set 2 seconds timeout for telemetry
+### Removed
+- init command from config subcommand is removed. Please use init from the root command.
+  - Example: `aptos config init` -> `aptos init`
+### Fixed
+- Panic issue when running `aptos move test` is fixed - GitHub issue #8516
 
 ## [2.0.1] - 2023/06/05
 ### Fixed
-- Updated txn expiration configuration for the faucet built into the CLI to make local testnet startup more reliable.
+- Updated txn expiration configuration for the faucet built into the CLI to make localnet startup more reliable.
 
 ## [2.0.0] - 2023/06/01
 ### Added

@@ -7,6 +7,7 @@
 use crate::{
     ast::ModuleName,
     builder::{model_builder::ModelBuilder, module_builder::BytecodeModule},
+    metadata::LanguageVersion,
     model::{FunId, GlobalEnv, Loc, ModuleId, StructId},
     options::ModelBuilderOptions,
 };
@@ -27,12 +28,12 @@ use move_binary_format::{
 use move_compiler::{
     self,
     compiled_unit::{self, AnnotatedCompiledScript, AnnotatedCompiledUnit},
-    diagnostics::Diagnostics,
+    diagnostics::{codes::Severity, Diagnostics},
     expansion::ast::{self as E, ModuleIdent, ModuleIdent_},
     naming::ast as N,
-    parser::ast::{self as P, ModuleName as ParserModuleName},
+    parser::ast::{self as P, CallKind, ModuleName as ParserModuleName},
     shared::{
-        parse_named_address, unique_map::UniqueMap, Identifier as IdentifierTrait,
+        parse_named_address, unique_map::UniqueMap, CompilationEnv, Identifier as IdentifierTrait,
         NumericalAddress, PackagePaths,
     },
     typing::ast as T,
@@ -49,35 +50,70 @@ use std::{
 pub mod ast;
 mod builder;
 pub mod code_writer;
+pub mod constant_folder;
 pub mod exp_generator;
 pub mod exp_rewriter;
 pub mod intrinsics;
+pub mod metadata;
 pub mod model;
 pub mod options;
 pub mod pragmas;
+pub mod pureness_checker;
 pub mod spec_translator;
 pub mod symbol;
 pub mod ty;
 pub mod well_known;
 
 // =================================================================================================
-// Entry Point
+// Entry Point V2
 
-/// Build the move model with default compilation flags and default options and no named addresses.
-/// This collects transitive dependencies for move sources from the provided directory list.
-pub fn run_model_builder<
-    Paths: Into<MoveSymbol> + Clone,
-    NamedAddress: Into<MoveSymbol> + Clone,
->(
-    move_sources: Vec<PackagePaths<Paths, NamedAddress>>,
-    deps: Vec<PackagePaths<Paths, NamedAddress>>,
-) -> anyhow::Result<GlobalEnv> {
-    run_model_builder_with_options(move_sources, deps, ModelBuilderOptions::default())
+/// Represents information about a package: the sources it contains and the package private
+/// address mapping.
+#[derive(Debug, Clone)]
+pub struct PackageInfo {
+    pub sources: Vec<String>,
+    pub address_map: BTreeMap<String, NumericalAddress>,
 }
 
-/// Build the move model with default compilation flags and custom options and a set of provided
-/// named addreses.
-/// This collects transitive dependencies for move sources from the provided directory list.
+/// Builds the Move model for the v2 compiler. This builds the model, compiling both code
+/// and specs from sources into typed-checked AST. No bytecode is attached to the model.
+/// This currently uses the v1 compiler as the parser (up to expansion AST), after that
+/// a new type checker.
+pub fn run_model_builder_in_compiler_mode(
+    source: PackageInfo,
+    deps: Vec<PackageInfo>,
+    skip_attribute_checks: bool,
+    known_attributes: &BTreeSet<String>,
+    language_version: LanguageVersion,
+    compile_test_code: bool,
+) -> anyhow::Result<GlobalEnv> {
+    let to_package_paths = |PackageInfo {
+                                sources,
+                                address_map,
+                            }| PackagePaths {
+        name: None,
+        paths: sources,
+        named_address_map: address_map,
+    };
+    run_model_builder_with_options_and_compilation_flags(
+        vec![to_package_paths(source)],
+        deps.into_iter().map(to_package_paths).collect(),
+        ModelBuilderOptions {
+            compile_via_model: true,
+            language_version,
+            ..ModelBuilderOptions::default()
+        },
+        Flags::model_compilation()
+            .set_skip_attribute_checks(skip_attribute_checks)
+            .set_keep_testing_functions(compile_test_code),
+        known_attributes,
+    )
+}
+
+// =================================================================================================
+// Entry Point V1
+
+/// Build the move model with default compilation flags and custom options.
 pub fn run_model_builder_with_options<
     Paths: Into<MoveSymbol> + Clone,
     NamedAddress: Into<MoveSymbol> + Clone,
@@ -85,17 +121,21 @@ pub fn run_model_builder_with_options<
     move_sources: Vec<PackagePaths<Paths, NamedAddress>>,
     deps: Vec<PackagePaths<Paths, NamedAddress>>,
     options: ModelBuilderOptions,
+    skip_attribute_checks: bool,
+    known_attributes: &BTreeSet<String>,
 ) -> anyhow::Result<GlobalEnv> {
+    let mut flags = Flags::verification();
+    flags = flags.set_skip_attribute_checks(skip_attribute_checks);
     run_model_builder_with_options_and_compilation_flags(
         move_sources,
         deps,
         options,
-        Flags::verification(),
+        flags,
+        known_attributes,
     )
 }
 
 /// Build the move model with custom compilation flags and custom options
-/// This collects transitive dependencies for move sources from the provided directory list.
 pub fn run_model_builder_with_options_and_compilation_flags<
     Paths: Into<MoveSymbol> + Clone,
     NamedAddress: Into<MoveSymbol> + Clone,
@@ -104,14 +144,17 @@ pub fn run_model_builder_with_options_and_compilation_flags<
     deps: Vec<PackagePaths<Paths, NamedAddress>>,
     options: ModelBuilderOptions,
     flags: Flags,
+    known_attributes: &BTreeSet<String>,
 ) -> anyhow::Result<GlobalEnv> {
     let mut env = GlobalEnv::new();
+    env.set_language_version(options.language_version);
+    let compile_via_model = options.compile_via_model;
     env.set_extension(options);
 
     // Step 1: parse the program to get comments and a separation of targets and dependencies.
-    let (files, comments_and_compiler_res) = Compiler::from_package_paths(move_sources, deps)
-        .set_flags(flags)
-        .run::<PASS_PARSER>()?;
+    let (files, comments_and_compiler_res) =
+        Compiler::from_package_paths(move_sources, deps, flags, known_attributes)
+            .run::<PASS_PARSER>()?;
     let (comment_map, compiler) = match comments_and_compiler_res {
         Err(diags) => {
             // Add source files so that the env knows how to translate locations of parse errors
@@ -202,7 +245,17 @@ pub fn run_model_builder_with_options_and_compilation_flags<
             add_move_lang_diagnostics(&mut env, diags);
             return Ok(env);
         },
-        Ok(compiler) => compiler.into_ast(),
+        Ok(mut compiler) => {
+            // There may have been errors but nevertheless a stepped compiler is returned.
+            let compiler_env: &mut CompilationEnv = compiler.compilation_env();
+            if let Err(diags) = compiler_env.check_diags_at_or_above_severity(Severity::Warning) {
+                add_move_lang_diagnostics(&mut env, diags);
+                if env.has_errors() {
+                    return Ok(env);
+                }
+            }
+            compiler.into_ast()
+        },
     };
 
     // Extract the module/script closure
@@ -230,7 +283,12 @@ pub fn run_model_builder_with_options_and_compilation_flags<
     let mut expansion_ast = {
         let E::Program { modules, scripts } = expansion_ast;
         let modules = modules.filter_map(|mident, mut mdef| {
-            visited_modules.contains(&mident.value).then(|| {
+            // Always need to include the vector module because it can be implicitly used.
+            // TODO(#12492): we can remove this once this bug is fixed
+            let is_vector = mident.value.address.into_addr_bytes().into_inner()
+                == AccountAddress::ONE
+                && mident.value.module.0.value.as_str() == "vector";
+            (is_vector || visited_modules.contains(&mident.value)).then(|| {
                 mdef.is_source_module = true;
                 mdef
             })
@@ -238,65 +296,198 @@ pub fn run_model_builder_with_options_and_compilation_flags<
         E::Program { modules, scripts }
     };
 
-    // Step 4: retrospectively add lambda-lifted function to expansion AST
-    let (compiler, inlining_ast) = match compiler
-        .at_expansion(expansion_ast.clone())
-        .run::<PASS_INLINING>()
-    {
-        Err(diags) => {
-            add_move_lang_diagnostics(&mut env, diags);
-            return Ok(env);
-        },
-        Ok(compiler) => compiler.into_ast(),
-    };
+    if !compile_via_model {
+        // Legacy compilation via v1 compiler
+        // TODO: eventually remove this code and related helpers
 
-    for (loc, module_id, expansion_module) in expansion_ast.modules.iter_mut() {
-        match inlining_ast.modules.get_(module_id) {
-            None => {
-                env.error(
-                    &env.to_loc(&loc),
-                    "unable to find matching module in inlining AST",
-                );
+        // Step 4: retrospectively add lambda-lifted function to expansion AST
+        let (compiler, inlining_ast) = match compiler
+            .at_expansion(expansion_ast.clone())
+            .run::<PASS_INLINING>()
+        {
+            Err(diags) => {
+                add_move_lang_diagnostics(&mut env, diags);
+                return Ok(env);
             },
-            Some(inlining_module) => {
-                retrospective_lambda_lifting(inlining_module, expansion_module);
-            },
-        }
-    }
+            Ok(compiler) => compiler.into_ast(),
+        };
 
-    // Step 5: Run the compiler from instrumented expansion AST fully to the compiled units
-
-    let units = match compiler
-        .at_expansion(expansion_ast.clone())
-        .run::<PASS_COMPILATION>()
-    {
-        Err(diags) => {
-            add_move_lang_diagnostics(&mut env, diags);
-            return Ok(env);
-        },
-        Ok(compiler) => {
-            let (units, warnings) = compiler.into_compiled_units();
-            if !warnings.is_empty() {
-                // NOTE: these diagnostics are just warnings. it should be feasible to continue the
-                // model building here. But before that, register the warnings to the `GlobalEnv`
-                // first so we get a chance to report these warnings as well.
-                add_move_lang_diagnostics(&mut env, warnings);
+        for (loc, module_id, expansion_module) in expansion_ast.modules.iter_mut() {
+            match inlining_ast.modules.get_(module_id) {
+                None => {
+                    env.error(
+                        &env.to_loc(&loc),
+                        "unable to find matching module in inlining AST",
+                    );
+                },
+                Some(inlining_module) => {
+                    retrospective_lambda_lifting(inlining_module, expansion_module);
+                },
             }
-            units
-        },
-    };
+        }
 
-    // Check for bytecode verifier errors (there should not be any)
-    let diags = compiled_unit::verify_units(&units);
-    if !diags.is_empty() {
-        add_move_lang_diagnostics(&mut env, diags);
-        return Ok(env);
+        // Step 5: Run the compiler from instrumented expansion AST fully to the compiled units
+
+        let units = match compiler
+            .at_expansion(expansion_ast.clone())
+            .run::<PASS_COMPILATION>()
+        {
+            Err(diags) => {
+                add_move_lang_diagnostics(&mut env, diags);
+                return Ok(env);
+            },
+            Ok(compiler) => {
+                let (units, warnings) = compiler.into_compiled_units();
+                if !warnings.is_empty() {
+                    // NOTE: these diagnostics are just warnings. it should be feasible to continue the
+                    // model building here. But before that, register the warnings to the `GlobalEnv`
+                    // first so we get a chance to report these warnings as well.
+                    add_move_lang_diagnostics(&mut env, warnings);
+                }
+                units
+            },
+        };
+
+        // Check for bytecode verifier errors (there should not be any)
+        let diags = compiled_unit::verify_units(&units);
+        if !diags.is_empty() {
+            add_move_lang_diagnostics(&mut env, diags);
+            return Ok(env);
+        }
+
+        // Now that it is known that the program has no errors, run the spec checker on verified units
+        // plus expanded AST. This will populate the environment including any errors.
+        run_spec_checker(&mut env, units, expansion_ast);
+        Ok(env)
+    } else {
+        // New compilation via model (compiler v2). The expansion AST will be type checked.
+        // No bytecode is attached.
+        run_move_checker(&mut env, expansion_ast);
+        Ok(env)
+    }
+}
+
+fn run_move_checker(env: &mut GlobalEnv, program: E::Program) {
+    let mut builder = ModelBuilder::new(env);
+    for (module_count, (module_id, module_def)) in program
+        .modules
+        .into_iter()
+        .sorted_by_key(|(_, def)| def.dependency_order)
+        .enumerate()
+    {
+        let loc = builder.to_loc(&module_def.loc);
+        let addr_bytes = builder.resolve_address(&loc, &module_id.value.address);
+        let module_name = ModuleName::from_address_bytes_and_name(
+            addr_bytes,
+            builder
+                .env
+                .symbol_pool()
+                .make(&module_id.value.module.0.value),
+        );
+        // Assign new module id in the model.
+        let module_id = ModuleId::new(module_count);
+        // Associate the module name with the module id for lookups.
+        builder.module_table.insert(module_name.clone(), module_id);
+        let mut module_translator = ModuleBuilder::new(&mut builder, module_id, module_name);
+        module_translator.translate(loc, module_def, None);
+    }
+    for (i, (_, script_def)) in program.scripts.into_iter().enumerate() {
+        let loc = builder.to_loc(&script_def.loc);
+        let module_name = ModuleName::pseudo_script_name(builder.env.symbol_pool(), i);
+        let module_id = ModuleId::new(builder.env.module_data.len());
+        let mut module_translator = ModuleBuilder::new(&mut builder, module_id, module_name);
+        let module_def = expansion_script_to_module(script_def);
+        module_translator.translate(loc, module_def, None);
     }
 
-    // Now that it is known that the program has no errors, run the spec checker on verified units
-    // plus expanded AST. This will populate the environment including any errors.
-    run_model_compiler(&mut env, units, expansion_ast);
-    Ok(env)
+    // Populate GlobalEnv with model-level information
+    builder.populate_env();
+
+    // After all specs have been processed, warn about any unused schemas.
+    builder.warn_unused_schemas();
+
+    // Perform any remaining friend-declaration checks and update friend module id information.
+    check_and_update_friend_info(builder);
+}
+
+/// Checks if any friend declarations are invalid because:
+///     - they are self-friend declarations
+///     - they are out-of-address friend declarations
+///     - they refer to unbound modules
+/// If so, report errors.
+/// Also, update friend module id information: this function assumes all modules have been assigned ids.
+///
+/// Note: we assume (a) friend declarations creating cyclic dependencies (cycle size > 1),
+///                 (b) duplicate friend declarations
+/// have been reported already. Currently, these checks happen in the expansion phase.
+fn check_and_update_friend_info(mut builder: ModelBuilder) {
+    let module_table = std::mem::take(&mut builder.module_table);
+    let env = builder.env;
+    // To save (loc, name) info about self friend decls.
+    let mut self_friends = vec![];
+    // To save (loc, friend_module_name, current_module_name) info about out-of-address friend decls.
+    let mut out_of_address_friends = vec![];
+    // To save (loc, friend_module_name) info about unbound modules in friend decls.
+    let mut unbound_friend_modules = vec![];
+    // Patch up information about friend module ids, as all the modules have ids by now.
+    for module in env.module_data.iter_mut() {
+        let mut friend_modules = BTreeSet::new();
+        for friend_decl in module.friend_decls.iter_mut() {
+            // Save information of out-of-address friend decls to report error later.
+            if friend_decl.module_name.addr() != module.name.addr() {
+                out_of_address_friends.push((
+                    friend_decl.loc.clone(),
+                    friend_decl.module_name.clone(),
+                    module.name.clone(),
+                ));
+            }
+            if let Some(friend_mod_id) = module_table.get(&friend_decl.module_name) {
+                friend_decl.module_id = Some(*friend_mod_id);
+                friend_modules.insert(*friend_mod_id);
+                // Save information of self-friend decls to report error later.
+                if module.id == *friend_mod_id {
+                    self_friends.push((friend_decl.loc.clone(), friend_decl.module_name.clone()));
+                }
+            } else {
+                // Save information of unbound modules in friend decls to report error later.
+                unbound_friend_modules
+                    .push((friend_decl.loc.clone(), friend_decl.module_name.clone()));
+            }
+        }
+        module.friend_modules = friend_modules;
+    }
+    // Report self-friend errors.
+    for (loc, module_name) in self_friends {
+        env.error(
+            &loc,
+            &format!(
+                "cannot declare module `{}` as a friend of itself",
+                module_name.display_full(env)
+            ),
+        );
+    }
+    // Report out-of-address friend errors.
+    for (loc, friend_mod_name, cur_mod_name) in out_of_address_friends {
+        env.error(
+            &loc,
+            &format!(
+                "friend modules of `{}` must have the same address, \
+                    but the declared friend module `{}` has a different address",
+                cur_mod_name.display_full(env),
+                friend_mod_name.display_full(env),
+            ),
+        );
+    }
+    // Report unbound friend errors.
+    for (loc, friend_mod_name) in unbound_friend_modules {
+        env.error(
+            &loc,
+            &format!(
+                "unbound module `{}` in friend declaration",
+                friend_mod_name.display_full(env)
+            ),
+        );
+    }
 }
 
 fn collect_related_modules_recursive<'a>(
@@ -314,7 +505,7 @@ fn collect_related_modules_recursive<'a>(
     }
 }
 
-fn add_move_lang_diagnostics(env: &mut GlobalEnv, diags: Diagnostics) {
+pub fn add_move_lang_diagnostics(env: &mut GlobalEnv, diags: Diagnostics) {
     let mk_label = |is_primary: bool, (loc, msg): (move_ir_types::location::Loc, String)| {
         let style = if is_primary {
             LabelStyle::Primary
@@ -340,7 +531,7 @@ fn add_move_lang_diagnostics(env: &mut GlobalEnv, diags: Diagnostics) {
 }
 
 #[allow(deprecated)]
-fn script_into_module(compiled_script: CompiledScript) -> CompiledModule {
+pub fn script_into_module(compiled_script: CompiledScript, name: &str) -> CompiledModule {
     let mut script = compiled_script;
 
     // Add the "<SELF>" identifier if it isn't present.
@@ -350,20 +541,20 @@ fn script_into_module(compiled_script: CompiledScript) -> CompiledModule {
     let self_ident_idx = match script
         .identifiers
         .iter()
-        .position(|ident| ident.as_ident_str() == self_module_name())
+        .position(|ident| ident.as_ident_str().as_str() == name)
     {
         Some(idx) => IdentifierIndex::new(idx as u16),
         None => {
             let idx = IdentifierIndex::new(script.identifiers.len() as u16);
             script
                 .identifiers
-                .push(Identifier::new(self_module_name().to_string()).unwrap());
+                .push(Identifier::new(name.to_string()).unwrap());
             idx
         },
     };
 
-    // Add a dummy adress if none exists.
-    let dummy_addr = AccountAddress::new([0xFF; AccountAddress::LENGTH]);
+    // Add a dummy address if none exists.
+    let dummy_addr = AccountAddress::MAX_ADDRESS;
     let dummy_addr_idx = match script
         .address_identifiers
         .iter()
@@ -413,6 +604,7 @@ fn script_into_module(compiled_script: CompiledScript) -> CompiledModule {
         parameters: script.parameters,
         return_: return_sig_idx,
         type_parameters: script.type_parameters,
+        access_specifiers: None, // TODO: access specifiers for script functions
     });
 
     // Create a function definition for the main function.
@@ -452,11 +644,7 @@ fn script_into_module(compiled_script: CompiledScript) -> CompiledModule {
 }
 
 #[allow(deprecated)]
-fn run_model_compiler(
-    env: &mut GlobalEnv,
-    units: Vec<AnnotatedCompiledUnit>,
-    mut eprog: E::Program,
-) {
+fn run_spec_checker(env: &mut GlobalEnv, units: Vec<AnnotatedCompiledUnit>, mut eprog: E::Program) {
     let mut builder = ModelBuilder::new(env);
 
     // Merge the compiled units with source ASTs, preserving the order of the compiled
@@ -521,7 +709,7 @@ fn run_model_compiler(
                     .unwrap();
 
                 let expanded_module = expansion_script_to_module(expanded_script);
-                let module = script_into_module(script.script);
+                let module = script_into_module(script.script, self_module_name().as_str());
                 modules.push((
                     ident,
                     expanded_module,
@@ -623,6 +811,7 @@ fn retrospective_lambda_lifting(
             },
             entry: None,
             acquires: vec![], // TODO: might need inference here
+            access_specifiers: None,
             body: new_body,
             specs: BTreeMap::new(),
         };
@@ -658,6 +847,7 @@ fn expansion_script_to_module(script: E::Script) -> E::ModuleDefinition {
         constants,
         function,
         specs,
+        use_decls,
     } = script;
 
     // Construct a pseudo module definition.
@@ -677,6 +867,7 @@ fn expansion_script_to_module(script: E::Script) -> E::ModuleDefinition {
         constants,
         functions,
         specs,
+        use_decls,
     }
 }
 
@@ -864,7 +1055,11 @@ fn downgrade_exp_inlining_to_expansion(exp: &T::Exp) -> E::Exp {
                 .collect();
             Exp_::Call(
                 sp(name.loc(), access),
-                *is_macro,
+                if *is_macro {
+                    CallKind::Macro
+                } else {
+                    CallKind::Regular
+                },
                 if rewritten_ty_args.is_empty() {
                     None
                 } else {
@@ -882,7 +1077,7 @@ fn downgrade_exp_inlining_to_expansion(exp: &T::Exp) -> E::Exp {
             };
             Exp_::Call(
                 sp(target.loc(), access),
-                false,
+                CallKind::Regular,
                 None,
                 sp(exp.exp.loc, rewritten_arguments),
             )
@@ -899,7 +1094,7 @@ fn downgrade_exp_inlining_to_expansion(exp: &T::Exp) -> E::Exp {
             };
             Exp_::Call(
                 sp(builtin.loc, access),
-                false,
+                CallKind::Regular,
                 None,
                 sp(exp.exp.loc, rewritten_arguments),
             )

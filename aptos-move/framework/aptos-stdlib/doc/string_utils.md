@@ -1,5 +1,5 @@
 
-<a name="0x1_string_utils"></a>
+<a id="0x1_string_utils"></a>
 
 # Module `0x1::string_utils`
 
@@ -9,7 +9,8 @@ A module for formatting move values as strings.
 -  [Struct `Cons`](#0x1_string_utils_Cons)
 -  [Struct `NIL`](#0x1_string_utils_NIL)
 -  [Struct `FakeCons`](#0x1_string_utils_FakeCons)
--  [Constants](#@Constants_0)
+    -  [[test_only]](#@[test_only]_0)
+-  [Constants](#@Constants_1)
 -  [Function `to_string`](#0x1_string_utils_to_string)
 -  [Function `to_string_with_canonical_addresses`](#0x1_string_utils_to_string_with_canonical_addresses)
 -  [Function `to_string_with_integer_types`](#0x1_string_utils_to_string_with_integer_types)
@@ -26,9 +27,17 @@ A module for formatting move values as strings.
 -  [Function `list4`](#0x1_string_utils_list4)
 -  [Function `native_format`](#0x1_string_utils_native_format)
 -  [Function `native_format_list`](#0x1_string_utils_native_format_list)
--  [Specification](#@Specification_1)
-    -  [Function `native_format`](#@Specification_1_native_format)
-    -  [Function `native_format_list`](#@Specification_1_native_format_list)
+-  [Specification](#@Specification_2)
+    -  [Function `to_string`](#@Specification_2_to_string)
+    -  [Function `to_string_with_canonical_addresses`](#@Specification_2_to_string_with_canonical_addresses)
+    -  [Function `to_string_with_integer_types`](#@Specification_2_to_string_with_integer_types)
+    -  [Function `debug_string`](#@Specification_2_debug_string)
+    -  [Function `format1`](#@Specification_2_format1)
+    -  [Function `format2`](#@Specification_2_format2)
+    -  [Function `format3`](#@Specification_2_format3)
+    -  [Function `format4`](#@Specification_2_format4)
+    -  [Function `native_format`](#@Specification_2_native_format)
+    -  [Function `native_format_list`](#@Specification_2_native_format_list)
 
 
 <pre><code><b>use</b> <a href="../../move-stdlib/doc/string.md#0x1_string">0x1::string</a>;
@@ -36,7 +45,7 @@ A module for formatting move values as strings.
 
 
 
-<a name="0x1_string_utils_Cons"></a>
+<a id="0x1_string_utils_Cons"></a>
 
 ## Struct `Cons`
 
@@ -69,7 +78,7 @@ A module for formatting move values as strings.
 
 </details>
 
-<a name="0x1_string_utils_NIL"></a>
+<a id="0x1_string_utils_NIL"></a>
 
 ## Struct `NIL`
 
@@ -96,9 +105,14 @@ A module for formatting move values as strings.
 
 </details>
 
-<a name="0x1_string_utils_FakeCons"></a>
+<a id="0x1_string_utils_FakeCons"></a>
 
 ## Struct `FakeCons`
+
+
+<a id="@[test_only]_0"></a>
+
+### [test_only]
 
 
 
@@ -129,12 +143,12 @@ A module for formatting move values as strings.
 
 </details>
 
-<a name="@Constants_0"></a>
+<a id="@Constants_1"></a>
 
 ## Constants
 
 
-<a name="0x1_string_utils_EARGS_MISMATCH"></a>
+<a id="0x1_string_utils_EARGS_MISMATCH"></a>
 
 The number of values in the list does not match the number of "{}" in the format string.
 
@@ -144,7 +158,7 @@ The number of values in the list does not match the number of "{}" in the format
 
 
 
-<a name="0x1_string_utils_EINVALID_FORMAT"></a>
+<a id="0x1_string_utils_EINVALID_FORMAT"></a>
 
 The format string is not valid.
 
@@ -154,7 +168,17 @@ The format string is not valid.
 
 
 
-<a name="0x1_string_utils_to_string"></a>
+<a id="0x1_string_utils_EUNABLE_TO_FORMAT_DELAYED_FIELD"></a>
+
+Formatting is not possible because the value contains delayed fields such as aggregators.
+
+
+<pre><code><b>const</b> <a href="string_utils.md#0x1_string_utils_EUNABLE_TO_FORMAT_DELAYED_FIELD">EUNABLE_TO_FORMAT_DELAYED_FIELD</a>: u64 = 3;
+</code></pre>
+
+
+
+<a id="0x1_string_utils_to_string"></a>
 
 ## Function `to_string`
 
@@ -185,7 +209,7 @@ For std::string::String the output is the string itself including quotes, eg.
 
 </details>
 
-<a name="0x1_string_utils_to_string_with_canonical_addresses"></a>
+<a id="0x1_string_utils_to_string_with_canonical_addresses"></a>
 
 ## Function `to_string_with_canonical_addresses`
 
@@ -210,7 +234,7 @@ Format addresses as 64 zero-padded hexadecimals.
 
 </details>
 
-<a name="0x1_string_utils_to_string_with_integer_types"></a>
+<a id="0x1_string_utils_to_string_with_integer_types"></a>
 
 ## Function `to_string_with_integer_types`
 
@@ -235,7 +259,7 @@ Format emitting integers with types ie. 6u8 or 128u32.
 
 </details>
 
-<a name="0x1_string_utils_debug_string"></a>
+<a id="0x1_string_utils_debug_string"></a>
 
 ## Function `debug_string`
 
@@ -260,7 +284,7 @@ Format vectors and structs with newlines and indentation.
 
 </details>
 
-<a name="0x1_string_utils_format1"></a>
+<a id="0x1_string_utils_format1"></a>
 
 ## Function `format1`
 
@@ -285,7 +309,7 @@ Formatting with a rust-like format string, eg. <code><a href="string_utils.md#0x
 
 </details>
 
-<a name="0x1_string_utils_format2"></a>
+<a id="0x1_string_utils_format2"></a>
 
 ## Function `format2`
 
@@ -309,7 +333,7 @@ Formatting with a rust-like format string, eg. <code><a href="string_utils.md#0x
 
 </details>
 
-<a name="0x1_string_utils_format3"></a>
+<a id="0x1_string_utils_format3"></a>
 
 ## Function `format3`
 
@@ -333,7 +357,7 @@ Formatting with a rust-like format string, eg. <code><a href="string_utils.md#0x
 
 </details>
 
-<a name="0x1_string_utils_format4"></a>
+<a id="0x1_string_utils_format4"></a>
 
 ## Function `format4`
 
@@ -357,7 +381,7 @@ Formatting with a rust-like format string, eg. <code><a href="string_utils.md#0x
 
 </details>
 
-<a name="0x1_string_utils_cons"></a>
+<a id="0x1_string_utils_cons"></a>
 
 ## Function `cons`
 
@@ -379,7 +403,7 @@ Formatting with a rust-like format string, eg. <code><a href="string_utils.md#0x
 
 </details>
 
-<a name="0x1_string_utils_nil"></a>
+<a id="0x1_string_utils_nil"></a>
 
 ## Function `nil`
 
@@ -401,7 +425,7 @@ Formatting with a rust-like format string, eg. <code><a href="string_utils.md#0x
 
 </details>
 
-<a name="0x1_string_utils_list1"></a>
+<a id="0x1_string_utils_list1"></a>
 
 ## Function `list1`
 
@@ -423,7 +447,7 @@ Formatting with a rust-like format string, eg. <code><a href="string_utils.md#0x
 
 </details>
 
-<a name="0x1_string_utils_list2"></a>
+<a id="0x1_string_utils_list2"></a>
 
 ## Function `list2`
 
@@ -445,7 +469,7 @@ Formatting with a rust-like format string, eg. <code><a href="string_utils.md#0x
 
 </details>
 
-<a name="0x1_string_utils_list3"></a>
+<a id="0x1_string_utils_list3"></a>
 
 ## Function `list3`
 
@@ -467,7 +491,7 @@ Formatting with a rust-like format string, eg. <code><a href="string_utils.md#0x
 
 </details>
 
-<a name="0x1_string_utils_list4"></a>
+<a id="0x1_string_utils_list4"></a>
 
 ## Function `list4`
 
@@ -489,7 +513,7 @@ Formatting with a rust-like format string, eg. <code><a href="string_utils.md#0x
 
 </details>
 
-<a name="0x1_string_utils_native_format"></a>
+<a id="0x1_string_utils_native_format"></a>
 
 ## Function `native_format`
 
@@ -511,7 +535,7 @@ Formatting with a rust-like format string, eg. <code><a href="string_utils.md#0x
 
 </details>
 
-<a name="0x1_string_utils_native_format_list"></a>
+<a id="0x1_string_utils_native_format_list"></a>
 
 ## Function `native_format_list`
 
@@ -533,12 +557,148 @@ Formatting with a rust-like format string, eg. <code><a href="string_utils.md#0x
 
 </details>
 
-<a name="@Specification_1"></a>
+<a id="@Specification_2"></a>
 
 ## Specification
 
 
-<a name="@Specification_1_native_format"></a>
+<a id="@Specification_2_to_string"></a>
+
+### Function `to_string`
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="string_utils.md#0x1_string_utils_to_string">to_string</a>&lt;T&gt;(s: &T): <a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>
+</code></pre>
+
+
+
+
+<pre><code><b>aborts_if</b> <b>false</b>;
+<b>ensures</b> result == <a href="string_utils.md#0x1_string_utils_spec_native_format">spec_native_format</a>(s, <b>false</b>, <b>false</b>, <b>true</b>, <b>false</b>);
+</code></pre>
+
+
+
+<a id="@Specification_2_to_string_with_canonical_addresses"></a>
+
+### Function `to_string_with_canonical_addresses`
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="string_utils.md#0x1_string_utils_to_string_with_canonical_addresses">to_string_with_canonical_addresses</a>&lt;T&gt;(s: &T): <a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>
+</code></pre>
+
+
+
+
+<pre><code><b>aborts_if</b> <b>false</b>;
+<b>ensures</b> result == <a href="string_utils.md#0x1_string_utils_spec_native_format">spec_native_format</a>(s, <b>false</b>, <b>true</b>, <b>true</b>, <b>false</b>);
+</code></pre>
+
+
+
+<a id="@Specification_2_to_string_with_integer_types"></a>
+
+### Function `to_string_with_integer_types`
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="string_utils.md#0x1_string_utils_to_string_with_integer_types">to_string_with_integer_types</a>&lt;T&gt;(s: &T): <a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>
+</code></pre>
+
+
+
+
+<pre><code><b>aborts_if</b> <b>false</b>;
+<b>ensures</b> result == <a href="string_utils.md#0x1_string_utils_spec_native_format">spec_native_format</a>(s, <b>false</b>, <b>true</b>, <b>true</b>, <b>false</b>);
+</code></pre>
+
+
+
+<a id="@Specification_2_debug_string"></a>
+
+### Function `debug_string`
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="string_utils.md#0x1_string_utils_debug_string">debug_string</a>&lt;T&gt;(s: &T): <a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>
+</code></pre>
+
+
+
+
+<pre><code><b>aborts_if</b> <b>false</b>;
+<b>ensures</b> result == <a href="string_utils.md#0x1_string_utils_spec_native_format">spec_native_format</a>(s, <b>true</b>, <b>false</b>, <b>false</b>, <b>false</b>);
+</code></pre>
+
+
+
+<a id="@Specification_2_format1"></a>
+
+### Function `format1`
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="string_utils.md#0x1_string_utils_format1">format1</a>&lt;T0: drop&gt;(fmt: &<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;, a: T0): <a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>
+</code></pre>
+
+
+
+
+<pre><code><b>aborts_if</b> <a href="string_utils.md#0x1_string_utils_args_mismatch_or_invalid_format">args_mismatch_or_invalid_format</a>(fmt, <a href="string_utils.md#0x1_string_utils_list1">list1</a>(a));
+<b>ensures</b> result == <a href="string_utils.md#0x1_string_utils_spec_native_format_list">spec_native_format_list</a>(fmt, <a href="string_utils.md#0x1_string_utils_list1">list1</a>(a));
+</code></pre>
+
+
+
+<a id="@Specification_2_format2"></a>
+
+### Function `format2`
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="string_utils.md#0x1_string_utils_format2">format2</a>&lt;T0: drop, T1: drop&gt;(fmt: &<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;, a: T0, b: T1): <a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>
+</code></pre>
+
+
+
+
+<pre><code><b>aborts_if</b> <a href="string_utils.md#0x1_string_utils_args_mismatch_or_invalid_format">args_mismatch_or_invalid_format</a>(fmt, <a href="string_utils.md#0x1_string_utils_list2">list2</a>(a, b));
+<b>ensures</b> result == <a href="string_utils.md#0x1_string_utils_spec_native_format_list">spec_native_format_list</a>(fmt, <a href="string_utils.md#0x1_string_utils_list2">list2</a>(a, b));
+</code></pre>
+
+
+
+<a id="@Specification_2_format3"></a>
+
+### Function `format3`
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="string_utils.md#0x1_string_utils_format3">format3</a>&lt;T0: drop, T1: drop, T2: drop&gt;(fmt: &<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;, a: T0, b: T1, c: T2): <a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>
+</code></pre>
+
+
+
+
+<pre><code><b>aborts_if</b> <a href="string_utils.md#0x1_string_utils_args_mismatch_or_invalid_format">args_mismatch_or_invalid_format</a>(fmt, <a href="string_utils.md#0x1_string_utils_list3">list3</a>(a, b, c));
+<b>ensures</b> result == <a href="string_utils.md#0x1_string_utils_spec_native_format_list">spec_native_format_list</a>(fmt, <a href="string_utils.md#0x1_string_utils_list3">list3</a>(a, b, c));
+</code></pre>
+
+
+
+<a id="@Specification_2_format4"></a>
+
+### Function `format4`
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="string_utils.md#0x1_string_utils_format4">format4</a>&lt;T0: drop, T1: drop, T2: drop, T3: drop&gt;(fmt: &<a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;, a: T0, b: T1, c: T2, d: T3): <a href="../../move-stdlib/doc/string.md#0x1_string_String">string::String</a>
+</code></pre>
+
+
+
+
+<pre><code><b>aborts_if</b> <a href="string_utils.md#0x1_string_utils_args_mismatch_or_invalid_format">args_mismatch_or_invalid_format</a>(fmt, <a href="string_utils.md#0x1_string_utils_list4">list4</a>(a, b, c, d));
+<b>ensures</b> result == <a href="string_utils.md#0x1_string_utils_spec_native_format_list">spec_native_format_list</a>(fmt, <a href="string_utils.md#0x1_string_utils_list4">list4</a>(a, b, c, d));
+</code></pre>
+
+
+
+<a id="@Specification_2_native_format"></a>
 
 ### Function `native_format`
 
@@ -550,11 +710,13 @@ Formatting with a rust-like format string, eg. <code><a href="string_utils.md#0x
 
 
 <pre><code><b>pragma</b> opaque;
+<b>aborts_if</b> <b>false</b>;
+<b>ensures</b> result == <a href="string_utils.md#0x1_string_utils_spec_native_format">spec_native_format</a>(s, type_tag, canonicalize, single_line, include_int_types);
 </code></pre>
 
 
 
-<a name="@Specification_1_native_format_list"></a>
+<a id="@Specification_2_native_format_list"></a>
 
 ### Function `native_format_list`
 
@@ -566,7 +728,36 @@ Formatting with a rust-like format string, eg. <code><a href="string_utils.md#0x
 
 
 <pre><code><b>pragma</b> opaque;
+<b>aborts_if</b> <a href="string_utils.md#0x1_string_utils_args_mismatch_or_invalid_format">args_mismatch_or_invalid_format</a>(fmt, val);
+<b>ensures</b> result == <a href="string_utils.md#0x1_string_utils_spec_native_format_list">spec_native_format_list</a>(fmt, val);
 </code></pre>
 
 
-[move-book]: https://aptos.dev/guides/move-guides/book/SUMMARY
+
+
+<a id="0x1_string_utils_spec_native_format"></a>
+
+
+<pre><code><b>fun</b> <a href="string_utils.md#0x1_string_utils_spec_native_format">spec_native_format</a>&lt;T&gt;(s: T, type_tag: bool, canonicalize: bool, single_line: bool, include_int_types: bool): String;
+</code></pre>
+
+
+
+
+<a id="0x1_string_utils_spec_native_format_list"></a>
+
+
+<pre><code><b>fun</b> <a href="string_utils.md#0x1_string_utils_spec_native_format_list">spec_native_format_list</a>&lt;T&gt;(fmt: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;, val: T): String;
+</code></pre>
+
+
+
+
+<a id="0x1_string_utils_args_mismatch_or_invalid_format"></a>
+
+
+<pre><code><b>fun</b> <a href="string_utils.md#0x1_string_utils_args_mismatch_or_invalid_format">args_mismatch_or_invalid_format</a>&lt;T&gt;(fmt: <a href="../../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;u8&gt;, val: T): bool;
+</code></pre>
+
+
+[move-book]: https://aptos.dev/move/book/SUMMARY

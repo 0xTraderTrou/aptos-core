@@ -1,7 +1,7 @@
 // Copyright © Aptos Foundation
 // Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
-#![allow(clippy::integer_arithmetic)]
+#![allow(clippy::arithmetic_side_effects)]
 
 use crate::{
     block::Block,
@@ -43,7 +43,7 @@ prop_compose! {
         parent_qc in Just(parent_qc)
     ) -> Block {
         Block::new_proposal(
-            Payload::empty(false),
+            Payload::empty(false, true),
             round,
             aptos_infallible::duration_since_epoch().as_micros() as u64,
             parent_qc,

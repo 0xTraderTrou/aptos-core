@@ -5,15 +5,16 @@
 use super::new_test_context;
 use crate::tests::new_test_context_with_config;
 use aptos_api_test_context::{assert_json, current_function_name, pretty, TestContext};
-use aptos_config::config::NodeConfig;
+use aptos_config::config::{GasEstimationStaticOverride, NodeConfig};
 use aptos_crypto::{
-    ed25519::Ed25519PrivateKey,
+    ed25519::{Ed25519PrivateKey, Ed25519Signature},
     multi_ed25519::{MultiEd25519PrivateKey, MultiEd25519PublicKey},
     PrivateKey, SigningKey, Uniform,
 };
 use aptos_sdk::types::LocalAccount;
 use aptos_types::{
     account_address::AccountAddress,
+    account_config::aptos_test_root_address,
     transaction::{
         authenticator::{AuthenticationKey, TransactionAuthenticator},
         EntryFunction, Script, SignedTransaction,
@@ -251,6 +252,156 @@ async fn test_multi_agent_signed_transaction() {
         .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fee_payer_signed_transaction() {
+    let mut context = new_test_context(current_function_name!());
+    let account = context.gen_account();
+    let fee_payer = context.create_account().await;
+    let factory = context.transaction_factory();
+    let mut root_account = context.root_account().await;
+
+    context
+        .commit_block(&[context.create_user_account_by(&mut root_account, &fee_payer)])
+        .await;
+
+    // Create a new account with a multi-agent signer
+    let txn = root_account.sign_fee_payer_with_transaction_builder(
+        vec![],
+        &fee_payer,
+        factory.create_user_account(account.public_key()),
+    );
+
+    let body = bcs::to_bytes(&txn).unwrap();
+    let resp = context
+        .expect_status_code(202)
+        .post_bcs_txn("/transactions", body)
+        .await;
+
+    let (sender, _, fee_payer_signer) = match txn.authenticator() {
+        TransactionAuthenticator::FeePayer {
+            sender,
+            secondary_signer_addresses: _,
+            secondary_signers,
+            fee_payer_address: _,
+            fee_payer_signer,
+        } => (sender, secondary_signers, fee_payer_signer),
+        _ => panic!(
+            "expecting TransactionAuthenticator::FeePayer, but got: {:?}",
+            txn.authenticator()
+        ),
+    };
+    assert_json(
+        resp["signature"].clone(),
+        json!({
+            "type": "fee_payer_signature",
+            "sender": {
+                "type": "ed25519_signature",
+                "public_key": format!("0x{}", hex::encode(sender.public_key_bytes())),
+                "signature": format!("0x{}", hex::encode(sender.signature_bytes())),
+            },
+            "secondary_signer_addresses": [
+            ],
+            "secondary_signers": [
+            ],
+            "fee_payer_address": fee_payer.address().to_hex_literal(),
+            "fee_payer_signer": {
+                "type": "ed25519_signature",
+                "public_key": format!("0x{}",hex::encode(fee_payer_signer.public_key_bytes())),
+                "signature": format!("0x{}", hex::encode(fee_payer_signer.signature_bytes())),
+            },
+        }),
+    );
+
+    // ensure fee payer txns can be submitted into mempool by JSON format
+    context
+        .expect_status_code(202)
+        .post("/transactions", resp)
+        .await;
+
+    // Now test for the new format where the fee payer is unset... this also tests account creation
+    let another_account = context.gen_account();
+    let yet_another_account = context.gen_account();
+    let another_raw_txn = another_account
+        .sign_fee_payer_with_transaction_builder(
+            vec![],
+            &fee_payer,
+            factory
+                .create_user_account(yet_another_account.public_key())
+                .max_gas_amount(200_000)
+                .gas_unit_price(1),
+        )
+        .into_raw_transaction();
+    let another_txn = another_raw_txn
+        .clone()
+        .sign_fee_payer(
+            another_account.private_key(),
+            vec![],
+            vec![],
+            AccountAddress::ZERO,
+            fee_payer.private_key(),
+        )
+        .unwrap();
+
+    let (sender, secondary_signer_addresses, secondary_signers) = match another_txn.authenticator()
+    {
+        TransactionAuthenticator::FeePayer {
+            sender,
+            secondary_signer_addresses,
+            secondary_signers,
+            fee_payer_address: _,
+            fee_payer_signer: _,
+        } => (sender, secondary_signer_addresses, secondary_signers),
+        _ => panic!(
+            "expecting TransactionAuthenticator::FeePayer, but got: {:?}",
+            txn.authenticator()
+        ),
+    };
+
+    let another_txn = another_raw_txn
+        .clone()
+        .sign_fee_payer(
+            another_account.private_key(),
+            vec![],
+            vec![],
+            fee_payer.address(),
+            fee_payer.private_key(),
+        )
+        .unwrap();
+
+    let another_txn = match another_txn.authenticator() {
+        TransactionAuthenticator::FeePayer {
+            sender: _,
+            secondary_signer_addresses: _,
+            secondary_signers: _,
+            fee_payer_address,
+            fee_payer_signer,
+        } => {
+            let auth = TransactionAuthenticator::fee_payer(
+                sender,
+                secondary_signer_addresses,
+                secondary_signers,
+                fee_payer_address,
+                fee_payer_signer,
+            );
+            SignedTransaction::new_signed_transaction(another_raw_txn, auth)
+        },
+        _ => panic!(
+            "expecting TransactionAuthenticator::FeePayer, but got: {:?}",
+            txn.authenticator()
+        ),
+    };
+
+    let body = bcs::to_bytes(&another_txn).unwrap();
+    let resp = context
+        .expect_status_code(202)
+        .post_bcs_txn("/transactions", body)
+        .await;
+    context
+        .expect_status_code(202)
+        .post("/transactions", resp)
+        .await;
+}
+
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_multi_ed25519_signed_transaction() {
@@ -261,7 +412,7 @@ async fn test_multi_ed25519_signed_transaction() {
     let auth_key = AuthenticationKey::multi_ed25519(&public_key);
 
     let factory = context.transaction_factory();
-    let mut root_account = context.root_account().await;
+    let root_account = context.root_account().await;
     // TODO: migrate once multi-ed25519 is supported
     let create_account_txn = root_account.sign_with_transaction_builder(
         factory.create_user_account(&Ed25519PrivateKey::generate_for_testing().public_key()),
@@ -269,8 +420,8 @@ async fn test_multi_ed25519_signed_transaction() {
     context.commit_block(&vec![create_account_txn]).await;
 
     let raw_txn = factory
-        .mint(auth_key.derived_address(), 1000)
-        .sender(auth_key.derived_address())
+        .mint(auth_key.account_address(), 1000)
+        .sender(auth_key.account_address())
         .sequence_number(0)
         .expiration_timestamp_secs(u64::MAX) // set timestamp to max to ensure static raw transaction
         .build();
@@ -401,6 +552,102 @@ async fn test_get_pending_transaction_by_hash() {
     let mut txn = context
         .get(&format!("/transactions/by_hash/{}", txn_hash))
         .await;
+
+    // The pending txn response from the POST request doesn't the type field,
+    // since it is a PendingTransaction, not a Transaction. Remove it from the
+    // response from the GET request and confirm it is correct before doing the
+    // JSON comparison.
+    assert_eq!(
+        txn.as_object_mut().unwrap().remove("type").unwrap(),
+        "pending_transaction"
+    );
+
+    assert_json(txn, pending_txn);
+
+    let not_found = context
+        .expect_status_code(404)
+        .get("/transactions/by_hash/0xdadfeddcca7cb6396c735e9094c76c6e4e9cb3e3ef814730693aed59bd87b31d")
+        .await;
+    context.check_golden_output(not_found);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_wait_transaction_by_hash() {
+    let mut node_config = NodeConfig::default();
+    node_config.api.wait_by_hash_timeout_ms = 2_000;
+    let mut context = new_test_context_with_config(current_function_name!(), node_config);
+    let account = context.gen_account();
+    let txn = context.create_user_account(&account).await;
+    context.commit_block(&vec![txn.clone()]).await;
+
+    let txns = context.get("/transactions?start=2&limit=1").await;
+    assert_eq!(1, txns.as_array().unwrap().len());
+
+    let start_time = std::time::Instant::now();
+    let resp = context
+        .get(&format!(
+            "/transactions/wait_by_hash/{}",
+            txns[0]["hash"].as_str().unwrap()
+        ))
+        .await;
+    // return immediately
+    assert!(start_time.elapsed().as_millis() < 2_000);
+    assert_json(resp, txns[0].clone());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_wait_transaction_by_hash_not_found() {
+    let mut node_config = NodeConfig::default();
+    node_config.api.wait_by_hash_timeout_ms = 2_000;
+    let mut context = new_test_context(current_function_name!());
+
+    let start_time = std::time::Instant::now();
+    let resp = context
+        .expect_status_code(404)
+        .get("/transactions/wait_by_hash/0xdadfeddcca7cb6396c735e9094c76c6e4e9cb3e3ef814730693aed59bd87b31d")
+        .await;
+    // return immediately
+    assert!(start_time.elapsed().as_millis() < 2_000);
+    context.check_golden_output(resp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_wait_transaction_by_invalid_hash() {
+    let mut node_config = NodeConfig::default();
+    node_config.api.wait_by_hash_timeout_ms = 2_000;
+    let mut context = new_test_context_with_config(current_function_name!(), node_config);
+
+    let start_time = std::time::Instant::now();
+    let resp = context
+        .expect_status_code(400)
+        .get("/transactions/wait_by_hash/0x1")
+        .await;
+    // return immediately
+    assert!(start_time.elapsed().as_millis() < 2_000);
+    context.check_golden_output(resp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_wait_pending_transaction_by_hash() {
+    let mut node_config = NodeConfig::default();
+    node_config.api.wait_by_hash_timeout_ms = 2_000;
+    let mut context = new_test_context_with_config(current_function_name!(), node_config);
+    let account = context.gen_account();
+    let txn = context.create_user_account(&account).await;
+    let body = bcs::to_bytes(&txn).unwrap();
+    let pending_txn = context
+        .expect_status_code(202)
+        .post_bcs_txn("/transactions", body)
+        .await;
+
+    let txn_hash = pending_txn["hash"].as_str().unwrap();
+
+    let start_time = std::time::Instant::now();
+    let mut txn = context
+        .get(&format!("/transactions/wait_by_hash/{}", txn_hash))
+        .await;
+    // return after waiting for pending to become committed
+    assert!(start_time.elapsed().as_millis() > 2_000);
 
     // The pending txn response from the POST request doesn't the type field,
     // since it is a PendingTransaction, not a Transaction. Remove it from the
@@ -598,7 +845,7 @@ async fn test_get_account_transactions_filter_transactions_by_limit() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_get_txn_execute_failed_by_invalid_script_payload_bytecode() {
     let context = new_test_context(current_function_name!());
-    let mut root_account = context.root_account().await;
+    let root_account = context.root_account().await;
     let invalid_bytecode = hex::decode("a11ceb0b030000").unwrap();
     let txn = root_account.sign_with_transaction_builder(
         context
@@ -813,7 +1060,7 @@ async fn test_get_txn_execute_failed_by_script_execution_failure() {
     let script =
         hex::decode("a11ceb0b030000000105000100000000050601000000000000000600000000000000001a0102")
             .unwrap();
-    let mut root_account = context.root_account().await;
+    let root_account = context.root_account().await;
     let txn = root_account.sign_with_transaction_builder(
         context
             .transaction_factory()
@@ -825,7 +1072,7 @@ async fn test_get_txn_execute_failed_by_script_execution_failure() {
 
 async fn test_submit_entry_function_api_validation(
     mut context: TestContext,
-    mut account: LocalAccount,
+    account: LocalAccount,
     address: &str,
     module_id: &str,
     func: &str,
@@ -869,7 +1116,7 @@ async fn test_submit_entry_function_api_validation(
 
 async fn test_get_txn_execute_failed_by_invalid_entry_function(
     context: TestContext,
-    mut account: LocalAccount,
+    account: LocalAccount,
     address: &str,
     module_id: &str,
     func: &str,
@@ -1119,6 +1366,8 @@ async fn test_gas_estimation_cache() {
     node_config.api.gas_estimation.low_block_history = max_block_history;
     node_config.api.gas_estimation.market_block_history = max_block_history;
     node_config.api.gas_estimation.aggressive_block_history = max_block_history;
+    let sleep_duration =
+        Duration::from_millis(node_config.api.gas_estimation.cache_expiration_ms * 2);
     let mut context = new_test_context_with_config(current_function_name!(), node_config);
 
     let ctx = &mut context;
@@ -1128,6 +1377,8 @@ async fn test_gas_estimation_cache() {
     }
     ctx.get("/estimate_gas_price").await;
     assert_eq!(ctx.last_updated_gas_estimation_cache_size(), 4);
+    // Wait for cache to expire
+    sleep(sleep_duration).await;
 
     // Expect max of 10 entries
     for _i in 0..8 {
@@ -1139,7 +1390,7 @@ async fn test_gas_estimation_cache() {
         max_block_history
     );
     // Wait for cache to expire
-    sleep(Duration::from_secs(1)).await;
+    sleep(sleep_duration).await;
     ctx.get("/estimate_gas_price").await;
     assert_eq!(
         ctx.last_updated_gas_estimation_cache_size(),
@@ -1156,7 +1407,7 @@ async fn test_gas_estimation_cache() {
         max_block_history
     );
     // Wait for cache to expire
-    sleep(Duration::from_secs(1)).await;
+    sleep(sleep_duration).await;
     ctx.get("/estimate_gas_price").await;
     assert_eq!(
         ctx.last_updated_gas_estimation_cache_size(),
@@ -1189,6 +1440,173 @@ async fn test_gas_estimation_disabled() {
         let cached = context.get("/estimate_gas_price").await;
         assert_eq!(resp, cached);
     }
+    context.check_golden_output(resp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_gas_estimation_static_override() {
+    let mut node_config = NodeConfig::default();
+    node_config.api.gas_estimation.enabled = true;
+    node_config.api.gas_estimation.static_override = Some(GasEstimationStaticOverride {
+        low: 100,
+        market: 200,
+        aggressive: 300,
+    });
+    let mut context = new_test_context_with_config(current_function_name!(), node_config);
+
+    let ctx = &mut context;
+    let creator = &mut ctx.gen_account();
+    let mint_txn = ctx.mint_user_account(creator).await;
+
+    // Include the mint txn in the first block
+    let mut block = vec![mint_txn];
+    // First block is ignored in gas estimate, so make 11
+    for _i in 0..11 {
+        fill_block(&mut block, ctx, creator).await;
+        ctx.commit_block(&block).await;
+        block.clear();
+    }
+
+    // It's disabled, so we always expect the default, despite the blocks being filled above
+    let resp = context.get("/estimate_gas_price").await;
+    for _i in 0..2 {
+        let cached = context.get("/estimate_gas_price").await;
+        assert_eq!(resp, cached);
+    }
+    context.check_golden_output(resp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_simulation_failure_error_message() {
+    let mut context = new_test_context(current_function_name!());
+    let admin0 = context.root_account().await;
+
+    // script {
+    //     fun main() {
+    //         1/0;
+    //     }
+    // }
+
+    let output = context.simulate_transaction(&admin0, json!({
+        "type": "script_payload",
+        "code": {
+            "bytecode": "a11ceb0b030000000105000100000000050601000000000000000600000000000000001a0102",
+        },
+        "type_arguments": [],
+        "arguments": [],
+    }), 200).await;
+    let resp = &output.as_array().unwrap()[0];
+
+    assert!(!resp["success"].as_bool().unwrap());
+    assert!(resp["vm_status"]
+        .as_str()
+        .unwrap()
+        .contains("Division by zero"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_runtime_error_message_in_interpreter() {
+    let context = new_test_context(current_function_name!());
+    let account = context.root_account().await;
+
+    let named_addresses = vec![("addr".to_string(), account.address())];
+    let path =
+        PathBuf::from(std::env!("CARGO_MANIFEST_DIR")).join("src/tests/move/pack_exceed_limit");
+    let payload = TestContext::build_package(path, named_addresses);
+    let txn = account.sign_with_transaction_builder(context.transaction_factory().payload(payload));
+    let body = bcs::to_bytes(&txn).unwrap();
+    let resp = context
+        .expect_status_code(202)
+        .post_bcs_txn("/transactions", body)
+        .await;
+
+    let resp = context
+        .expect_status_code(200)
+        .post(
+            "/transactions/simulate",
+            json!({
+                "sender": resp["sender"],
+                "sequence_number": resp["sequence_number"],
+                "max_gas_amount": resp["max_gas_amount"],
+                "gas_unit_price": resp["gas_unit_price"],
+                "expiration_timestamp_secs":resp["expiration_timestamp_secs"],
+                "payload": resp["payload"],
+                "signature": {
+                    "type": resp["signature"]["type"],
+                    "public_key": resp["signature"]["public_key"],
+                    "signature": Ed25519Signature::dummy_signature().to_string(),
+                }
+            }),
+        )
+        .await;
+
+    assert!(!resp[0]["success"].as_bool().unwrap());
+    let vm_status = resp[0]["vm_status"].as_str().unwrap();
+    assert!(vm_status.contains("VERIFICATION_ERROR"));
+    assert!(vm_status
+        .contains("Number of type nodes when constructing type layout exceeded the maximum"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_simulation_filter_deny() {
+    let mut node_config = NodeConfig::default();
+
+    // Blocklist the balance function.
+    let mut filter = node_config.api.simulation_filter.clone();
+    filter = filter.add_deny_all();
+    node_config.api.simulation_filter = filter;
+
+    let mut context = new_test_context_with_config(current_function_name!(), node_config);
+
+    let admin0 = context.root_account().await;
+
+    let resp = context.simulate_transaction(&admin0, json!({
+        "type": "script_payload",
+        "code": {
+            "bytecode": "a11ceb0b030000000105000100000000050601000000000000000600000000000000001a0102",
+        },
+        "type_arguments": [],
+        "arguments": [],
+    }), 403).await;
+
+    context.check_golden_output(resp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_simulation_filter_allow_sender() {
+    let mut node_config = NodeConfig::default();
+
+    // Allow the root sender only.
+    let mut filter = node_config.api.simulation_filter.clone();
+    filter = filter.add_allow_sender(aptos_test_root_address());
+    filter = filter.add_deny_all();
+    node_config.api.simulation_filter = filter;
+
+    let mut context = new_test_context_with_config(current_function_name!(), node_config);
+
+    let admin0 = context.root_account().await;
+    let other_account = context.create_account().await;
+
+    context.simulate_transaction(&admin0, json!({
+        "type": "script_payload",
+        "code": {
+            "bytecode": "a11ceb0b030000000105000100000000050601000000000000000600000000000000001a0102",
+        },
+        "type_arguments": [],
+        "arguments": [],
+    }), 200).await;
+
+    let resp = context.simulate_transaction(&other_account, json!({
+        "type": "script_payload",
+        "code": {
+            "bytecode": "a11ceb0b030000000105000100000000050601000000000000000600000000000000001a0102",
+        },
+        "type_arguments": [],
+        "arguments": [],
+    }), 403).await;
+
+    // It was difficult to prune when using a vec of responses so we just put the
+    // rejection response in the goldens.
     context.check_golden_output(resp);
 }
 

@@ -1,9 +1,11 @@
 // Copyright © Aptos Foundation
 // SPDX-License-Identifier: Apache-2.0
 
+use super::utils::fund_account;
 use crate::{
     common::{
         init::Network,
+        local_simulation,
         utils::{
             check_if_file_exists, create_dir_if_not_exist, dir_default_to_current,
             get_account_with_state, get_auth_key, get_sequence_number, parse_json_file,
@@ -19,19 +21,22 @@ use crate::{
 use anyhow::Context;
 use aptos_crypto::{
     ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature},
-    x25519, PrivateKey, ValidCryptoMaterial, ValidCryptoMaterialStringExt,
+    encoding_type::{EncodingError, EncodingType},
+    x25519, PrivateKey, ValidCryptoMaterialStringExt,
 };
-use aptos_debugger::AptosDebugger;
-use aptos_gas_profiling::FrameName;
 use aptos_global_constants::adjust_gas_headroom;
 use aptos_keygen::KeyGen;
 use aptos_logger::Level;
+use aptos_move_debugger::aptos_debugger::AptosDebugger;
 use aptos_rest_client::{
     aptos_api_types::{EntryFunctionId, HashValue, MoveType, ViewRequest},
     error::RestError,
     AptosBaseUrl, Client, Transaction,
 };
-use aptos_sdk::{transaction_builder::TransactionFactory, types::LocalAccount};
+use aptos_sdk::{
+    transaction_builder::TransactionFactory,
+    types::{HardwareWalletAccount, HardwareWalletType, LocalAccount, TransactionSigner},
+};
 use aptos_types::{
     chain_id::ChainId,
     transaction::{
@@ -39,10 +44,14 @@ use aptos_types::{
         SignedTransaction, TransactionArgument, TransactionPayload, TransactionStatus,
     },
 };
+use aptos_vm_types::output::VMOutput;
 use async_trait::async_trait;
-use clap::{ArgEnum, Parser};
+use clap::{Parser, ValueEnum};
 use hex::FromHexError;
-use move_core_types::{account_address::AccountAddress, language_storage::TypeTag};
+use move_core_types::{
+    account_address::AccountAddress, language_storage::TypeTag, vm_status::VMStatus,
+};
+use move_model::metadata::{CompilerVersion, LanguageVersion};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -51,7 +60,7 @@ use std::{
     convert::TryFrom,
     fmt::{Debug, Display, Formatter},
     fs::OpenOptions,
-    path::{Path, PathBuf},
+    path::PathBuf,
     str::FromStr,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -179,13 +188,30 @@ impl From<hex::FromHexError> for CliError {
 
 impl From<anyhow::Error> for CliError {
     fn from(e: anyhow::Error) -> Self {
-        CliError::UnexpectedError(e.to_string())
+        CliError::UnexpectedError(format!("{:#}", e))
     }
 }
 
 impl From<bcs::Error> for CliError {
     fn from(e: bcs::Error) -> Self {
         CliError::UnexpectedError(e.to_string())
+    }
+}
+
+impl From<aptos_ledger::AptosLedgerError> for CliError {
+    fn from(e: aptos_ledger::AptosLedgerError) -> Self {
+        CliError::UnexpectedError(e.to_string())
+    }
+}
+
+impl From<EncodingError> for CliError {
+    fn from(e: EncodingError) -> Self {
+        match e {
+            EncodingError::BCS(s, e) => CliError::BCS(s, e),
+            EncodingError::UnableToParse(s, e) => CliError::UnableToParse(s, e),
+            EncodingError::UnableToReadFile(s, e) => CliError::UnableToReadFile(s, e),
+            EncodingError::UTF8(s) => CliError::UnexpectedError(s),
+        }
     }
 }
 
@@ -221,6 +247,9 @@ pub struct ProfileConfig {
     /// URL for the Faucet endpoint (if applicable)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub faucet_url: Option<String>,
+    /// Derivation path index of the account on ledger
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derivation_path: Option<String>,
 }
 
 /// ProfileConfig but without the private parts
@@ -359,7 +388,7 @@ impl CliConfig {
 }
 
 /// Types of Keys used by the blockchain
-#[derive(ArgEnum, Clone, Copy, Debug)]
+#[derive(ValueEnum, Clone, Copy, Debug)]
 pub enum KeyType {
     /// Ed25519 key used for signing
     Ed25519,
@@ -419,6 +448,11 @@ impl ProfileOptions {
         ))
     }
 
+    pub fn derivation_path(&self) -> CliTypedResult<Option<String>> {
+        let profile = self.profile()?;
+        Ok(profile.derivation_path)
+    }
+
     pub fn public_key(&self) -> CliTypedResult<Ed25519PublicKey> {
         let profile = self.profile()?;
         if let Some(public_key) = profile.public_key {
@@ -448,65 +482,6 @@ impl ProfileOptions {
                 .clone()
                 .unwrap_or_else(|| DEFAULT_PROFILE.to_string()),
         ))
-    }
-}
-
-/// Types of encodings used by the blockchain
-#[derive(ArgEnum, Clone, Copy, Debug)]
-pub enum EncodingType {
-    /// Binary Canonical Serialization
-    BCS,
-    /// Hex encoded e.g. 0xABCDE12345
-    Hex,
-    /// Base 64 encoded
-    Base64,
-}
-
-impl EncodingType {
-    /// Encodes `Key` into one of the `EncodingType`s
-    pub fn encode_key<Key: ValidCryptoMaterial>(
-        &self,
-        name: &'static str,
-        key: &Key,
-    ) -> CliTypedResult<Vec<u8>> {
-        Ok(match self {
-            EncodingType::Hex => hex::encode_upper(key.to_bytes()).into_bytes(),
-            EncodingType::BCS => bcs::to_bytes(key).map_err(|err| CliError::BCS(name, err))?,
-            EncodingType::Base64 => base64::encode(key.to_bytes()).into_bytes(),
-        })
-    }
-
-    /// Loads a key from a file
-    pub fn load_key<Key: ValidCryptoMaterial>(
-        &self,
-        name: &'static str,
-        path: &Path,
-    ) -> CliTypedResult<Key> {
-        self.decode_key(name, read_from_file(path)?)
-    }
-
-    /// Decodes an encoded key given the known encoding
-    pub fn decode_key<Key: ValidCryptoMaterial>(
-        &self,
-        name: &'static str,
-        data: Vec<u8>,
-    ) -> CliTypedResult<Key> {
-        match self {
-            EncodingType::BCS => bcs::from_bytes(&data).map_err(|err| CliError::BCS(name, err)),
-            EncodingType::Hex => {
-                let hex_string = String::from_utf8(data)?;
-                Key::from_encoded_string(hex_string.trim())
-                    .map_err(|err| CliError::UnableToParse(name, err.to_string()))
-            },
-            EncodingType::Base64 => {
-                let string = String::from_utf8(data)?;
-                let bytes = base64::decode(string.trim())
-                    .map_err(|err| CliError::UnableToParse(name, err.to_string()))?;
-                Key::try_from(bytes.as_slice()).map_err(|err| {
-                    CliError::UnableToParse(name, format!("Failed to parse key {:?}", err))
-                })
-            },
-        }
     }
 }
 
@@ -556,36 +531,6 @@ impl RngArgs {
     }
 }
 
-impl Default for EncodingType {
-    fn default() -> Self {
-        EncodingType::Hex
-    }
-}
-
-impl Display for EncodingType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let str = match self {
-            EncodingType::BCS => "bcs",
-            EncodingType::Hex => "hex",
-            EncodingType::Base64 => "base64",
-        };
-        write!(f, "{}", str)
-    }
-}
-
-impl FromStr for EncodingType {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "hex" => Ok(EncodingType::Hex),
-            "bcs" => Ok(EncodingType::BCS),
-            "base64" => Ok(EncodingType::Base64),
-            _ => Err("Invalid encoding type"),
-        }
-    }
-}
-
 /// An insertable option for use with prompts.
 #[derive(Clone, Copy, Debug, Default, Parser, PartialEq, Eq)]
 pub struct PromptOptions {
@@ -624,7 +569,7 @@ pub struct EncodingOptions {
 #[derive(Debug, Parser)]
 pub struct AuthenticationKeyInputOptions {
     /// Authentication Key file input
-    #[clap(long, group = "authentication_key_input", parse(from_os_str))]
+    #[clap(long, group = "authentication_key_input", value_parser)]
     auth_key_file: Option<PathBuf>,
 
     /// Authentication key input
@@ -661,7 +606,7 @@ pub struct PublicKeyInputOptions {
     /// Ed25519 Public key input file name
     ///
     /// Mutually exclusive with `--public-key`
-    #[clap(long, group = "public_key_input", parse(from_os_str))]
+    #[clap(long, group = "public_key_input", value_parser)]
     public_key_file: Option<PathBuf>,
     /// Ed25519 Public key encoded in a type as shown in `encoding`
     ///
@@ -686,10 +631,10 @@ impl ExtractPublicKey for PublicKeyInputOptions {
         profile: &ProfileOptions,
     ) -> CliTypedResult<Ed25519PublicKey> {
         if let Some(ref file) = self.public_key_file {
-            encoding.load_key("--public-key-file", file.as_path())
+            Ok(encoding.load_key("--public-key-file", file.as_path())?)
         } else if let Some(ref key) = self.public_key {
             let key = key.as_bytes().to_vec();
-            encoding.decode_key("--public-key", key)
+            Ok(encoding.decode_key("--public-key", key)?)
         } else if let Some(Some(public_key)) = CliConfig::load_profile(
             profile.profile_name(),
             ConfigSearchMode::CurrentDirAndParents,
@@ -727,12 +672,46 @@ pub trait ParsePrivateKey {
 }
 
 #[derive(Debug, Default, Parser)]
+pub struct HardwareWalletOptions {
+    /// Derivation Path of your account in hardware wallet
+    ///
+    /// e.g format - m/44\'/637\'/0\'/0\'/0\'
+    /// Make sure your wallet is unlocked and have Aptos opened
+    #[clap(long)]
+    pub derivation_path: Option<String>,
+
+    /// Index of your account in hardware wallet
+    ///
+    /// This is the simpler version of derivation path e.g `format - [0]`
+    /// we will translate this index into `[m/44'/637'/0'/0'/0]`
+    #[clap(long)]
+    pub derivation_index: Option<String>,
+}
+
+impl HardwareWalletOptions {
+    pub fn extract_derivation_path(&self) -> CliTypedResult<Option<String>> {
+        if let Some(derivation_path) = &self.derivation_path {
+            Ok(Some(derivation_path.clone()))
+        } else if let Some(derivation_index) = &self.derivation_index {
+            let derivation_path = format!("m/44'/637'/{}'/0'/0'", derivation_index);
+            Ok(Some(derivation_path))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn is_hardware_wallet(&self) -> bool {
+        self.derivation_path.is_some() || self.derivation_index.is_some()
+    }
+}
+
+#[derive(Debug, Default, Parser)]
 pub struct PrivateKeyInputOptions {
     /// Signing Ed25519 private key file path
     ///
     /// Encoded with type from `--encoding`
     /// Mutually exclusive with `--private-key`
-    #[clap(long, group = "private_key_input", parse(from_os_str))]
+    #[clap(long, group = "private_key_input", value_parser)]
     private_key_file: Option<PathBuf>,
     /// Signing Ed25519 private key
     ///
@@ -771,6 +750,50 @@ impl PrivateKeyInputOptions {
         PrivateKeyInputOptions {
             private_key: None,
             private_key_file: Some(file),
+        }
+    }
+
+    /// Extract public key from CLI args with fallback to config
+    /// This will first try to extract public key from private_key from CLI args
+    /// With fallback to profile
+    /// NOTE: Use this function instead of 'extract_private_key_and_address' if this is HardwareWallet profile
+    /// HardwareWallet profile does not have private key in config
+    pub fn extract_public_key_and_address(
+        &self,
+        encoding: EncodingType,
+        profile: &ProfileOptions,
+        maybe_address: Option<AccountAddress>,
+    ) -> CliTypedResult<(Ed25519PublicKey, AccountAddress)> {
+        // Order of operations
+        // 1. CLI inputs
+        // 2. Profile
+        // 3. Derived
+        if let Some(private_key) = self.extract_private_key_cli(encoding)? {
+            // If we use the CLI inputs, then we should derive or use the address from the input
+            if let Some(address) = maybe_address {
+                Ok((private_key.public_key(), address))
+            } else {
+                let address = account_address_from_public_key(&private_key.public_key());
+                Ok((private_key.public_key(), address))
+            }
+        } else if let Some((Some(public_key), maybe_config_address)) = CliConfig::load_profile(
+            profile.profile_name(),
+            ConfigSearchMode::CurrentDirAndParents,
+        )?
+        .map(|p| (p.public_key, p.account))
+        {
+            match (maybe_address, maybe_config_address) {
+                (Some(address), _) => Ok((public_key, address)),
+                (_, Some(address)) => Ok((public_key, address)),
+                (None, None) => {
+                    let address = account_address_from_public_key(&public_key);
+                    Ok((public_key, address))
+                },
+            }
+        } else {
+            Err(CliError::CommandArgumentError(
+                "One of ['--private-key', '--private-key-file'], or ['public_key'] must present in profile".to_string(),
+            ))
         }
     }
 
@@ -849,14 +872,47 @@ impl PrivateKeyInputOptions {
     }
 }
 
+// Extract the public key by deriving private key, fall back to public key from profile
+// Order of operations
+// 1. Get the private key (either from CLI input or profile), and derive the public key from it
+// 2. Else get the public key directly from the config profile
+// 3. Else error
 impl ExtractPublicKey for PrivateKeyInputOptions {
     fn extract_public_key(
         &self,
         encoding: EncodingType,
         profile: &ProfileOptions,
     ) -> CliTypedResult<Ed25519PublicKey> {
-        self.extract_private_key(encoding, profile)
-            .map(|private_key| private_key.public_key())
+        // 1. Get the private key, and derive the public key
+        let private_key = if let Some(key) = self.extract_private_key_cli(encoding)? {
+            Some(key)
+        } else if let Some(Some(private_key)) = CliConfig::load_profile(
+            profile.profile_name(),
+            ConfigSearchMode::CurrentDirAndParents,
+        )?
+        .map(|p| p.private_key)
+        {
+            Some(private_key)
+        } else {
+            None
+        };
+
+        // 2. Get the public key from the config profile
+        // 3. Else error
+        if let Some(key) = private_key {
+            Ok(key.public_key())
+        } else if let Some(Some(public_key)) = CliConfig::load_profile(
+            profile.profile_name(),
+            ConfigSearchMode::CurrentDirAndParents,
+        )?
+        .map(|p| p.public_key)
+        {
+            Ok(public_key)
+        } else {
+            Err(CliError::CommandArgumentError(
+                "Unable to extract public key from Private Key input nor Profile".to_string(),
+            ))
+        }
     }
 }
 
@@ -874,13 +930,13 @@ pub fn account_address_from_public_key(public_key: &Ed25519PublicKey) -> Account
 }
 
 pub fn account_address_from_auth_key(auth_key: &AuthenticationKey) -> AccountAddress {
-    AccountAddress::new(*auth_key.derived_address())
+    AccountAddress::new(*auth_key.account_address())
 }
 
 #[derive(Debug, Parser)]
 pub struct SaveFile {
     /// Output file path
-    #[clap(long, parse(from_os_str))]
+    #[clap(long, value_parser)]
     pub output_file: PathBuf,
 
     #[clap(flatten)]
@@ -919,6 +975,12 @@ pub struct RestOptions {
     /// Connection timeout in seconds, used for the REST endpoint of the fullnode
     #[clap(long, default_value_t = DEFAULT_EXPIRATION_SECS, alias = "connection-timeout-s")]
     pub connection_timeout_secs: u64,
+
+    /// Key to use for ratelimiting purposes with the node API. This value will be used
+    /// as `Authorization: Bearer <key>`. You may also set this with the NODE_API_KEY
+    /// environment variable.
+    #[clap(long, env)]
+    pub node_api_key: Option<String>,
 }
 
 impl RestOptions {
@@ -926,6 +988,7 @@ impl RestOptions {
         RestOptions {
             url,
             connection_timeout_secs: connection_timeout_secs.unwrap_or(DEFAULT_EXPIRATION_SECS),
+            node_api_key: None,
         }
     }
 
@@ -947,30 +1010,41 @@ impl RestOptions {
     }
 
     pub fn client(&self, profile: &ProfileOptions) -> CliTypedResult<Client> {
-        Ok(Client::builder(AptosBaseUrl::Custom(self.url(profile)?))
+        let mut client = Client::builder(AptosBaseUrl::Custom(self.url(profile)?))
             .timeout(Duration::from_secs(self.connection_timeout_secs))
-            .header(aptos_api_types::X_APTOS_CLIENT, X_APTOS_CLIENT_VALUE)?
-            .build())
+            .header(aptos_api_types::X_APTOS_CLIENT, X_APTOS_CLIENT_VALUE)?;
+        if let Some(node_api_key) = &self.node_api_key {
+            client = client.api_key(node_api_key)?;
+        }
+        Ok(client.build())
     }
 }
 
 /// Options for compiling a move package dir
 #[derive(Debug, Clone, Parser)]
 pub struct MovePackageDir {
+    /// Enables dev mode, which uses all dev-addresses and dev-dependencies
+    ///
+    /// Dev mode allows for changing dependencies and addresses to the preset [dev-addresses] and
+    /// [dev-dependencies] fields.  This works both inside and out of tests for using preset values.
+    ///
+    /// Currently, it also additionally pulls in all test compilation artifacts
+    #[clap(long)]
+    pub dev: bool,
     /// Path to a move package (the folder with a Move.toml file)
-    #[clap(long, parse(from_os_str))]
+    #[clap(long, value_parser)]
     pub package_dir: Option<PathBuf>,
     /// Path to save the compiled move package
     ///
     /// Defaults to `<package_dir>/build`
-    #[clap(long, parse(from_os_str))]
+    #[clap(long, value_parser)]
     pub output_dir: Option<PathBuf>,
     /// Named addresses for the move binary
     ///
     /// Example: alice=0x1234, bob=0x5678
     ///
     /// Note: This will fail if there are duplicates in the Move.toml file remove those first.
-    #[clap(long, parse(try_from_str = crate::common::utils::parse_map), default_value = "")]
+    #[clap(long, value_parser = crate::common::utils::parse_map::<String, AccountAddressWrapper>, default_value = "")]
     pub(crate) named_addresses: BTreeMap<String, AccountAddressWrapper>,
 
     /// Skip pulling the latest git dependencies
@@ -984,16 +1058,43 @@ pub struct MovePackageDir {
     /// Specify the version of the bytecode the compiler is going to emit.
     #[clap(long)]
     pub bytecode_version: Option<u32>,
+
+    /// Specify the version of the compiler.
+    ///
+    /// Currently hidden until the official launch of Compiler V2
+    #[clap(long, hide = true, value_parser = clap::value_parser!(CompilerVersion))]
+    pub compiler_version: Option<CompilerVersion>,
+
+    /// Specify the language version to be supported.
+    ///
+    /// Currently hidden until the official launch of Compiler V2
+    #[clap(long, hide = true, value_parser = clap::value_parser!(LanguageVersion))]
+    pub language_version: Option<LanguageVersion>,
+
+    /// Do not complain about unknown attributes in Move code.
+    #[clap(long)]
+    pub skip_attribute_checks: bool,
+
+    /// Do apply extended checks for Aptos (e.g. `#[view]` attribute) also on test code.
+    /// NOTE: this behavior will become the default in the future.
+    /// See <https://github.com/aptos-labs/aptos-core/issues/10335>
+    #[clap(long, env = "APTOS_CHECK_TEST_CODE")]
+    pub check_test_code: bool,
 }
 
 impl MovePackageDir {
     pub fn new(package_dir: PathBuf) -> Self {
         Self {
+            dev: false,
             package_dir: Some(package_dir),
             output_dir: None,
             named_addresses: Default::default(),
             skip_fetch_latest_git_deps: true,
             bytecode_version: None,
+            compiler_version: None,
+            language_version: None,
+            skip_attribute_checks: false,
+            check_test_code: false,
         }
     }
 
@@ -1034,11 +1135,7 @@ impl FromStr for AccountAddressWrapper {
 
 /// Loads an account arg and allows for naming based on profiles
 pub fn load_account_arg(str: &str) -> Result<AccountAddress, CliError> {
-    if str.starts_with("0x") {
-        AccountAddress::from_hex_literal(str).map_err(|err| {
-            CliError::CommandArgumentError(format!("Failed to parse AccountAddress {}", err))
-        })
-    } else if let Ok(account_address) = AccountAddress::from_str(str) {
+    if let Ok(account_address) = AccountAddress::from_str(str) {
         Ok(account_address)
     } else if let Some(Some(account_address)) =
         CliConfig::load_profile(Some(str), ConfigSearchMode::CurrentDirAndParents)?
@@ -1078,12 +1175,6 @@ impl FromStr for MoveManifestAccountWrapper {
 pub fn load_manifest_account_arg(str: &str) -> Result<Option<AccountAddress>, CliError> {
     if str == "_" {
         Ok(None)
-    } else if str.starts_with("0x") {
-        AccountAddress::from_hex_literal(str)
-            .map(Some)
-            .map_err(|err| {
-                CliError::CommandArgumentError(format!("Failed to parse AccountAddress {}", err))
-            })
     } else if let Ok(account_address) = AccountAddress::from_str(str) {
         Ok(Some(account_address))
     } else if let Some(Some(private_key)) =
@@ -1105,6 +1196,11 @@ pub trait CliCommand<T: Serialize + Send>: Sized + Send {
     /// Returns a name for logging purposes
     fn command_name(&self) -> &'static str;
 
+    /// Returns whether the error should be JSONifyed.
+    fn jsonify_error_output(&self) -> bool {
+        true
+    }
+
     /// Executes the command, returning a command specific type
     async fn execute(self) -> CliTypedResult<T>;
 
@@ -1119,14 +1215,28 @@ pub trait CliCommand<T: Serialize + Send>: Sized + Send {
         let command_name = self.command_name();
         start_logger(level);
         let start_time = Instant::now();
-        to_common_result(command_name, start_time, self.execute().await).await
+        let jsonify_error_output = self.jsonify_error_output();
+        to_common_result(
+            command_name,
+            start_time,
+            self.execute().await,
+            jsonify_error_output,
+        )
+        .await
     }
 
     /// Same as execute serialized without setting up logging
     async fn execute_serialized_without_logger(self) -> CliResult {
         let command_name = self.command_name();
         let start_time = Instant::now();
-        to_common_result(command_name, start_time, self.execute().await).await
+        let jsonify_error_output = self.jsonify_error_output();
+        to_common_result(
+            command_name,
+            start_time,
+            self.execute().await,
+            jsonify_error_output,
+        )
+        .await
     }
 
     /// Executes the command, and throws away Ok(result) for the string Success
@@ -1134,7 +1244,14 @@ pub trait CliCommand<T: Serialize + Send>: Sized + Send {
         start_logger(Level::Warn);
         let command_name = self.command_name();
         let start_time = Instant::now();
-        to_common_success_result(command_name, start_time, self.execute().await).await
+        let jsonify_error_output = self.jsonify_error_output();
+        to_common_success_result(
+            command_name,
+            start_time,
+            self.execute().await,
+            jsonify_error_output,
+        )
+        .await
     }
 }
 
@@ -1230,6 +1347,18 @@ impl From<&Transaction> for TransactionSummary {
                 pending: None,
                 sequence_number: None,
             },
+            Transaction::ValidatorTransaction(txn) => TransactionSummary {
+                transaction_hash: txn.info.hash,
+                gas_used: None,
+                gas_unit_price: None,
+                pending: None,
+                sender: None,
+                sequence_number: None,
+                success: Some(txn.info.success),
+                timestamp_us: Some(txn.timestamp.0),
+                version: Some(txn.info.version.0),
+                vm_status: Some(txn.info.vm_status.clone()),
+            },
         }
     }
 }
@@ -1259,14 +1388,22 @@ pub struct FaucetOptions {
     /// URL for the faucet endpoint e.g. `https://faucet.devnet.aptoslabs.com`
     #[clap(long)]
     faucet_url: Option<reqwest::Url>,
+
+    /// Auth token to bypass faucet ratelimits. You can also set this as an environment
+    /// variable with FAUCET_AUTH_TOKEN.
+    #[clap(long, env)]
+    faucet_auth_token: Option<String>,
 }
 
 impl FaucetOptions {
-    pub fn new(faucet_url: Option<reqwest::Url>) -> Self {
-        FaucetOptions { faucet_url }
+    pub fn new(faucet_url: Option<reqwest::Url>, faucet_auth_token: Option<String>) -> Self {
+        FaucetOptions {
+            faucet_url,
+            faucet_auth_token,
+        }
     }
 
-    pub fn faucet_url(&self, profile: &ProfileOptions) -> CliTypedResult<reqwest::Url> {
+    fn faucet_url(&self, profile: &ProfileOptions) -> CliTypedResult<reqwest::Url> {
         if let Some(ref faucet_url) = self.faucet_url {
             Ok(faucet_url.clone())
         } else if let Some(Some(url)) = CliConfig::load_profile(
@@ -1278,8 +1415,26 @@ impl FaucetOptions {
             reqwest::Url::parse(&url)
                 .map_err(|err| CliError::UnableToParse("config faucet_url", err.to_string()))
         } else {
-            Err(CliError::CommandArgumentError("No faucet given.  Please add --faucet-url or add a faucet URL to the .aptos/config.yaml for the current profile".to_string()))
+            Err(CliError::CommandArgumentError("No faucet given. Please add --faucet-url or add a faucet URL to the .aptos/config.yaml for the current profile".to_string()))
         }
+    }
+
+    /// Fund an account with the faucet.
+    pub async fn fund_account(
+        &self,
+        rest_client: Client,
+        profile: &ProfileOptions,
+        num_octas: u64,
+        address: AccountAddress,
+    ) -> CliTypedResult<()> {
+        fund_account(
+            rest_client,
+            self.faucet_url(profile)?,
+            self.faucet_auth_token.as_deref(),
+            address,
+            num_octas,
+        )
+        .await
     }
 }
 
@@ -1327,6 +1482,12 @@ impl Default for GasOptions {
     }
 }
 
+#[derive(Debug)]
+pub enum AccountType {
+    Local,
+    HardwareWallet,
+}
+
 /// Common options for interacting with an account for a validator
 #[derive(Debug, Default, Parser)]
 pub struct TransactionOptions {
@@ -1334,7 +1495,7 @@ pub struct TransactionOptions {
     ///
     /// This allows you to override the account address from the derived account address
     /// in the event that the authentication key was rotated or for a resource account
-    #[clap(long, parse(try_from_str=crate::common::types::load_account_arg))]
+    #[clap(long, value_parser = crate::common::types::load_account_arg)]
     pub(crate) sender_account: Option<AccountAddress>,
 
     #[clap(flatten)]
@@ -1350,6 +1511,14 @@ pub struct TransactionOptions {
     #[clap(flatten)]
     pub(crate) prompt_options: PromptOptions,
 
+    /// If this option is set, simulate the transaction locally.
+    #[clap(long)]
+    pub(crate) local: bool,
+
+    /// If this option is set, benchmark the transaction locally.
+    #[clap(long)]
+    pub(crate) benchmark: bool,
+
     /// If this option is set, simulate the transaction locally using the debugger and generate
     /// flamegraphs that reflect the gas usage.
     #[clap(long)]
@@ -1362,7 +1531,29 @@ impl TransactionOptions {
         self.rest_options.client(&self.profile_options)
     }
 
-    /// Retrieves the public key and the associated address
+    pub fn get_transaction_account_type(&self) -> CliTypedResult<AccountType> {
+        if self.private_key_options.private_key.is_some()
+            || self.private_key_options.private_key_file.is_some()
+        {
+            Ok(AccountType::Local)
+        } else if let Some(profile) = CliConfig::load_profile(
+            self.profile_options.profile_name(),
+            ConfigSearchMode::CurrentDirAndParents,
+        )? {
+            if profile.private_key.is_some() {
+                Ok(AccountType::Local)
+            } else {
+                Ok(AccountType::HardwareWallet)
+            }
+        } else {
+            Err(CliError::CommandArgumentError(
+                "One of ['--private-key', '--private-key-file'] or profile must be used"
+                    .to_string(),
+            ))
+        }
+    }
+
+    /// Retrieves the private key and the associated address
     /// TODO: Cache this information
     pub fn get_key_and_address(&self) -> CliTypedResult<(Ed25519PrivateKey, AccountAddress)> {
         self.private_key_options.extract_private_key_and_address(
@@ -1372,8 +1563,21 @@ impl TransactionOptions {
         )
     }
 
+    pub fn get_public_key_and_address(&self) -> CliTypedResult<(Ed25519PublicKey, AccountAddress)> {
+        self.private_key_options.extract_public_key_and_address(
+            self.encoding_options.encoding,
+            &self.profile_options,
+            self.sender_account,
+        )
+    }
+
     pub fn sender_address(&self) -> CliTypedResult<AccountAddress> {
         Ok(self.get_key_and_address()?.1)
+    }
+
+    pub fn get_public_key(&self) -> CliTypedResult<Ed25519PublicKey> {
+        self.private_key_options
+            .extract_public_key(self.encoding_options.encoding, &self.profile_options)
     }
 
     /// Gets the auth key by account address. We need to fetch the auth key from Rest API rather than creating an
@@ -1402,7 +1606,7 @@ impl TransactionOptions {
         payload: TransactionPayload,
     ) -> CliTypedResult<Transaction> {
         let client = self.rest_client()?;
-        let (sender_key, sender_address) = self.get_key_and_address()?;
+        let (sender_public_key, sender_address) = self.get_public_key_and_address()?;
 
         // Ask to confirm price if the gas unit price is estimated above the lowest value when
         // it is automatically estimated
@@ -1458,7 +1662,7 @@ impl TransactionOptions {
 
             let signed_transaction = SignedTransaction::new(
                 unsigned_transaction,
-                sender_key.public_key(),
+                sender_public_key.clone(),
                 Ed25519Signature::try_from([0u8; 64].as_ref()).unwrap(),
             );
 
@@ -1497,26 +1701,59 @@ impl TransactionOptions {
             .with_gas_unit_price(gas_unit_price)
             .with_max_gas_amount(max_gas)
             .with_transaction_expiration_time(self.gas_options.expiration_secs);
-        let sender_account = &mut LocalAccount::new(sender_address, sender_key, sequence_number);
-        let transaction =
-            sender_account.sign_with_transaction_builder(transaction_factory.payload(payload));
-        let response = client
-            .submit_and_wait(&transaction)
-            .await
-            .map_err(|err| CliError::ApiError(err.to_string()))?;
 
-        Ok(response.into_inner())
+        match self.get_transaction_account_type() {
+            Ok(AccountType::Local) => {
+                let (private_key, _) = self.get_key_and_address()?;
+                let sender_account =
+                    &mut LocalAccount::new(sender_address, private_key, sequence_number);
+                let transaction = sender_account
+                    .sign_with_transaction_builder(transaction_factory.payload(payload));
+                let response = client
+                    .submit_and_wait(&transaction)
+                    .await
+                    .map_err(|err| CliError::ApiError(err.to_string()))?;
+
+                Ok(response.into_inner())
+            },
+            Ok(AccountType::HardwareWallet) => {
+                let sender_account = &mut HardwareWalletAccount::new(
+                    sender_address,
+                    sender_public_key,
+                    self.profile_options
+                        .derivation_path()
+                        .expect("derivative path is missing from profile")
+                        .unwrap(),
+                    HardwareWalletType::Ledger,
+                    sequence_number,
+                );
+                let transaction = sender_account
+                    .sign_with_transaction_builder(transaction_factory.payload(payload))?;
+                let response = client
+                    .submit_and_wait(&transaction)
+                    .await
+                    .map_err(|err| CliError::ApiError(err.to_string()))?;
+
+                Ok(response.into_inner())
+            },
+            Err(err) => Err(err),
+        }
     }
 
-    /// Simulate the transaction locally using the debugger, with the gas profiler enabled.
-    pub async fn profile_gas(
+    /// Simulates a transaction locally, using the debugger to fetch required data from remote.
+    async fn simulate_using_debugger<F>(
         &self,
         payload: TransactionPayload,
-    ) -> CliTypedResult<TransactionSummary> {
-        println!();
-        println!("Simulating transaction locally with the gas profiler...");
-        println!("This is still experimental so results may be inaccurate.");
-
+        execute: F,
+    ) -> CliTypedResult<TransactionSummary>
+    where
+        F: FnOnce(
+            &AptosDebugger,
+            u64,
+            SignedTransaction,
+            aptos_crypto::HashValue,
+        ) -> CliTypedResult<(VMStatus, VMOutput)>,
+    {
         let client = self.rest_client()?;
 
         // Fetch the chain states required for the simulation
@@ -1548,7 +1785,6 @@ impl TransactionOptions {
             }
         });
 
-        // Create and sign the transaction
         let transaction_factory = TransactionFactory::new(chain_id)
             .with_gas_unit_price(gas_unit_price)
             .with_max_gas_amount(max_gas)
@@ -1558,109 +1794,17 @@ impl TransactionOptions {
             sender_account.sign_with_transaction_builder(transaction_factory.payload(payload));
         let hash = transaction.clone().committed_hash();
 
-        // Execute the transaction using the debugger
         let debugger = AptosDebugger::rest_client(client).unwrap();
-        let res = debugger.execute_transaction_at_version_with_gas_profiler(version, transaction);
-        let (vm_status, output, gas_log) = res.map_err(|err| {
-            CliError::UnexpectedError(format!("failed to simulate txn with gas profiler: {}", err))
-        })?;
+        let (vm_status, vm_output) = execute(&debugger, version, transaction, hash)?;
 
-        // Generate the file name for the flamegraphs
-        let entry_point = gas_log.entry_point();
-
-        let human_readable_name = match entry_point {
-            FrameName::Script => "script".to_string(),
-            FrameName::Function {
-                module_id, name, ..
-            } => {
-                let addr_short = module_id.address().short_str_lossless();
-                let addr_truncated = if addr_short.len() > 4 {
-                    &addr_short[..4]
-                } else {
-                    addr_short.as_str()
-                };
-                format!("0x{}-{}-{}", addr_truncated, module_id.name(), name)
-            },
-        };
-        let raw_file_name = format!("txn-{}-{}", hash, human_readable_name);
-
-        // Create the directory if it does not exist yet.
-        let dir: &Path = Path::new("gas-profiling");
-
-        macro_rules! create_dir {
-            () => {
-                if let Err(err) = std::fs::create_dir(dir) {
-                    if err.kind() != std::io::ErrorKind::AlreadyExists {
-                        return Err(CliError::UnexpectedError(format!(
-                            "failed to create directory {}",
-                            dir.display()
-                        )));
-                    }
-                }
-            };
-        }
-
-        // Generate the execution & IO flamegraph.
-        println!();
-        match gas_log.to_flamegraph(format!("Transaction {} -- Execution & IO", hash))? {
-            Some(graph_bytes) => {
-                create_dir!();
-                let graph_file_path = Path::join(dir, format!("{}.exec_io.svg", raw_file_name));
-                std::fs::write(&graph_file_path, graph_bytes).map_err(|err| {
-                    CliError::UnexpectedError(format!(
-                        "Failed to write flamegraph to file {} : {:?}",
-                        graph_file_path.display(),
-                        err
-                    ))
-                })?;
-                println!(
-                    "Execution & IO Gas flamegraph saved to {}",
-                    graph_file_path.display()
-                );
-            },
-            None => {
-                println!("Skipped generating execution & IO flamegraph");
-            },
-        }
-
-        // Generate the storage fee flamegraph.
-        match gas_log
-            .storage
-            .to_flamegraph(format!("Transaction {} -- Storage Fee", hash))?
-        {
-            Some(graph_bytes) => {
-                create_dir!();
-                let graph_file_path = Path::join(dir, format!("{}.storage.svg", raw_file_name));
-                std::fs::write(&graph_file_path, graph_bytes).map_err(|err| {
-                    CliError::UnexpectedError(format!(
-                        "Failed to write flamegraph to file {} : {:?}",
-                        graph_file_path.display(),
-                        err
-                    ))
-                })?;
-                println!(
-                    "Storage fee flamegraph saved to {}",
-                    graph_file_path.display()
-                );
-            },
-            None => {
-                println!("Skipped generating storage fee flamegraph");
-            },
-        }
-
-        println!();
-
-        // Generate the transaction summary
-
-        // TODO(Gas): double check if this is correct.
-        let success = match output.status() {
+        let success = match vm_output.status() {
             TransactionStatus::Keep(exec_status) => Some(exec_status.is_success()),
             TransactionStatus::Discard(_) | TransactionStatus::Retry => None,
         };
 
-        Ok(TransactionSummary {
+        let summary = TransactionSummary {
             transaction_hash: hash.into(),
-            gas_used: Some(output.gas_used()),
+            gas_used: Some(vm_output.gas_used()),
             gas_unit_price: Some(gas_unit_price),
             pending: None,
             sender: Some(sender_address),
@@ -1669,7 +1813,53 @@ impl TransactionOptions {
             timestamp_us: None,
             version: Some(version), // The transaction is not comitted so there is no new version.
             vm_status: Some(vm_status.to_string()),
-        })
+        };
+
+        Ok(summary)
+    }
+
+    /// Simulates a transaction locally.
+    pub async fn simulate_locally(
+        &self,
+        payload: TransactionPayload,
+    ) -> CliTypedResult<TransactionSummary> {
+        println!();
+        println!("Simulating transaction locally...");
+
+        self.simulate_using_debugger(payload, local_simulation::run_transaction_using_debugger)
+            .await
+    }
+
+    /// Benchmarks the transaction payload locally.
+    /// The transaction is executed multiple times, and the median value is calculated to improve
+    /// the accuracy of the measurement results.
+    pub async fn benchmark_locally(
+        &self,
+        payload: TransactionPayload,
+    ) -> CliTypedResult<TransactionSummary> {
+        println!();
+        println!("Benchmarking transaction locally...");
+
+        self.simulate_using_debugger(
+            payload,
+            local_simulation::benchmark_transaction_using_debugger,
+        )
+        .await
+    }
+
+    /// Simulates the transaction locally with the gas profiler enabled.
+    pub async fn profile_gas(
+        &self,
+        payload: TransactionPayload,
+    ) -> CliTypedResult<TransactionSummary> {
+        println!();
+        println!("Simulating transaction locally using the gas profiler...");
+
+        self.simulate_using_debugger(
+            payload,
+            local_simulation::profile_transaction_using_debugger,
+        )
+        .await
     }
 
     pub async fn estimate_gas_price(&self) -> CliTypedResult<u64> {
@@ -1692,41 +1882,22 @@ pub struct OptionalPoolAddressArgs {
     /// Address of the Staking pool
     ///
     /// Defaults to the profile's `AccountAddress`
-    #[clap(long, parse(try_from_str=crate::common::types::load_account_arg))]
+    #[clap(long, value_parser = crate::common::types::load_account_arg)]
     pub(crate) pool_address: Option<AccountAddress>,
 }
 
 #[derive(Parser)]
 pub struct PoolAddressArgs {
     /// Address of the Staking pool
-    #[clap(long, parse(try_from_str=crate::common::types::load_account_arg))]
+    #[clap(long, value_parser = crate::common::types::load_account_arg)]
     pub(crate) pool_address: AccountAddress,
-}
-
-// This struct includes TypeInfo (account_address, module_name, and struct_name)
-// and RotationProofChallenge-specific information (sequence_number, originator, current_auth_key, and new_public_key)
-// Since the struct RotationProofChallenge is defined in "0x1::account::RotationProofChallenge",
-// we will be passing in "0x1" to `account_address`, "account" to `module_name`, and "RotationProofChallenge" to `struct_name`
-// Originator refers to the user's address
-#[derive(Serialize, Deserialize)]
-pub struct RotationProofChallenge {
-    // Should be `CORE_CODE_ADDRESS`
-    pub account_address: AccountAddress,
-    // Should be `account`
-    pub module_name: String,
-    // Should be `RotationProofChallenge`
-    pub struct_name: String,
-    pub sequence_number: u64,
-    pub originator: AccountAddress,
-    pub current_auth_key: AccountAddress,
-    pub new_public_key: Vec<u8>,
 }
 
 /// Common options for interactions with a multisig account.
 #[derive(Clone, Debug, Parser, Serialize)]
 pub struct MultisigAccount {
     /// The address of the multisig account to interact with
-    #[clap(long, parse(try_from_str=crate::common::types::load_account_arg))]
+    #[clap(long, value_parser = crate::common::types::load_account_arg)]
     pub(crate) multisig_address: AccountAddress,
 }
 
@@ -1744,7 +1915,7 @@ pub struct TypeArgVec {
     /// TypeTag arguments separated by spaces.
     ///
     /// Example: `u8 u16 u32 u64 u128 u256 bool address vector signer`
-    #[clap(long, multiple_values = true)]
+    #[clap(long, num_args = 0..)]
     pub(crate) type_args: Vec<MoveType>,
 }
 
@@ -1778,7 +1949,7 @@ impl TryInto<Vec<TypeTag>> for TypeArgVec {
     }
 }
 
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 pub struct ArgWithTypeVec {
     /// Arguments combined with their type separated by spaces.
     ///
@@ -1788,7 +1959,7 @@ pub struct ArgWithTypeVec {
     /// quotes based on your shell interpreter)
     ///
     /// Example: `address:0x1 bool:true u8:0 u256:1234 "bool:[true, false]" 'address:[["0xace", "0xbee"], []]'`
-    #[clap(long, multiple_values = true)]
+    #[clap(long, num_args = 0..)]
     pub(crate) args: Vec<ArgWithType>,
 }
 
@@ -1852,7 +2023,7 @@ pub struct EntryFunctionArguments {
     /// Function name as `<ADDRESS>::<MODULE_ID>::<FUNCTION_NAME>`
     ///
     /// Example: `0x842ed41fad9640a2ad08fdd7d3e4f7f505319aac7d67e1c0dd6a7cce8732c7e3::message::set_message`
-    #[clap(long, required_unless_present = "json-file")]
+    #[clap(long, required_unless_present = "json_file")]
     pub function_id: Option<MemberId>,
 
     #[clap(flatten)]
@@ -1861,7 +2032,7 @@ pub struct EntryFunctionArguments {
     pub(crate) arg_vec: ArgWithTypeVec,
 
     /// JSON file specifying public entry function ID, type arguments, and arguments.
-    #[clap(long, parse(from_os_str), conflicts_with_all = &["function-id", "args", "type-args"])]
+    #[clap(long, value_parser, conflicts_with_all = &["function_id", "args", "type_args"])]
     pub(crate) json_file: Option<PathBuf>,
 }
 
@@ -1937,7 +2108,7 @@ pub struct ScriptFunctionArguments {
     pub(crate) arg_vec: ArgWithTypeVec,
 
     /// JSON file specifying type arguments and arguments.
-    #[clap(long, parse(from_os_str), conflicts_with_all = &["args", "type-args"])]
+    #[clap(long, value_parser, conflicts_with_all = &["args", "type_args"])]
     pub(crate) json_file: Option<PathBuf>,
 }
 
@@ -2007,4 +2178,14 @@ impl TryInto<ScriptFunctionArguments> for ScriptFunctionArgumentsJSON {
             json_file: None,
         })
     }
+}
+
+#[derive(Parser)]
+pub struct OverrideSizeCheckOption {
+    /// Whether to override the check for maximal size of published data
+    ///
+    /// This won't bypass on chain checks, so if you are not allowed to go over the size check, it
+    /// will still be blocked from publishing.
+    #[clap(long)]
+    pub(crate) override_size_check: bool,
 }

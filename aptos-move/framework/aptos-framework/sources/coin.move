@@ -124,8 +124,20 @@ module aptos_framework::coin {
         amount: u64,
     }
 
+    #[event]
+    struct Deposit<phantom CoinType> has drop, store {
+        account: address,
+        amount: u64,
+    }
+
     /// Event emitted when some amount of a coin is withdrawn from an account.
     struct WithdrawEvent has drop, store {
+        amount: u64,
+    }
+
+    #[event]
+    struct Withdraw<phantom CoinType> has drop, store {
+        account: address,
         amount: u64,
     }
 
@@ -149,7 +161,7 @@ module aptos_framework::coin {
     }
 
     /// This should be called by on-chain governance to update the config and allow
-    // or disallow upgradability of total supply.
+    /// or disallow upgradability of total supply.
     public fun allow_supply_upgrades(aptos_framework: &signer, allowed: bool) acquires SupplyConfig {
         system_addresses::assert_aptos_framework(aptos_framework);
         let allow_upgrades = &mut borrow_global_mut<SupplyConfig>(@aptos_framework).allow_upgrades;
@@ -161,7 +173,7 @@ module aptos_framework::coin {
     //
 
     /// Creates a new aggregatable coin with value overflowing on `limit`. Note that this function can
-    /// only be called by Aptos Framework (0x1) account for now becuase of `create_aggregator`.
+    /// only be called by Aptos Framework (0x1) account for now because of `create_aggregator`.
     public(friend) fun initialize_aggregatable_coin<CoinType>(aptos_framework: &signer): AggregatableCoin<CoinType> {
         let aggregator = aggregator_factory::create_aggregator(aptos_framework, MAX_U64);
         AggregatableCoin<CoinType> {
@@ -196,7 +208,10 @@ module aptos_framework::coin {
     }
 
     /// Merges `coin` into aggregatable coin (`dst_coin`).
-    public(friend) fun merge_aggregatable_coin<CoinType>(dst_coin: &mut AggregatableCoin<CoinType>, coin: Coin<CoinType>) {
+    public(friend) fun merge_aggregatable_coin<CoinType>(
+        dst_coin: &mut AggregatableCoin<CoinType>,
+        coin: Coin<CoinType>
+    ) {
         spec {
             update supply<CoinType> = supply<CoinType> - coin.value;
         };
@@ -251,6 +266,17 @@ module aptos_framework::coin {
     }
 
     #[view]
+    /// Returns `true` is account_addr has frozen the CoinStore or if it's not registered at all
+    public fun is_coin_store_frozen<CoinType>(account_addr: address): bool acquires CoinStore {
+        if (!is_account_registered<CoinType>(account_addr)) {
+            return true
+        };
+
+        let coin_store = borrow_global<CoinStore<CoinType>>(account_addr);
+        coin_store.frozen
+    }
+
+    #[view]
     /// Returns `true` if `account_addr` is registered to receive `CoinType`.
     public fun is_account_registered<CoinType>(account_addr: address): bool {
         exists<CoinStore<CoinType>>(account_addr)
@@ -290,7 +316,10 @@ module aptos_framework::coin {
         }
     }
 
+    //
     // Public functions
+    //
+
     /// Burn `coin` with capability.
     /// The capability `_cap` should be passed as a reference to `BurnCapability<CoinType>`.
     public fun burn<CoinType>(
@@ -342,11 +371,26 @@ module aptos_framework::coin {
             !coin_store.frozen,
             error::permission_denied(EFROZEN),
         );
-
+        if (std::features::module_event_migration_enabled()) {
+            event::emit(Deposit<CoinType> { account: account_addr, amount: coin.value });
+        };
         event::emit_event<DepositEvent>(
             &mut coin_store.deposit_events,
             DepositEvent { amount: coin.value },
         );
+
+        merge(&mut coin_store.coin, coin);
+    }
+
+    /// Deposit the coin balance into the recipient's account without checking if the account is frozen.
+    /// This is for internal use only and doesn't emit an DepositEvent.
+    public(friend) fun force_deposit<CoinType>(account_addr: address, coin: Coin<CoinType>) acquires CoinStore {
+        assert!(
+            is_account_registered<CoinType>(account_addr),
+            error::not_found(ECOIN_STORE_NOT_PUBLISHED),
+        );
+
+        let coin_store = borrow_global_mut<CoinStore<CoinType>>(account_addr);
 
         merge(&mut coin_store.coin, coin);
     }
@@ -488,7 +532,11 @@ module aptos_framework::coin {
             name,
             symbol,
             decimals,
-            supply: if (monitor_supply) { option::some(optional_aggregator::new(MAX_U128, parallelizable)) } else { option::none() },
+            supply: if (monitor_supply) {
+                option::some(
+                    optional_aggregator::new(MAX_U128, parallelizable)
+                )
+            } else { option::none() },
         };
         move_to(account, coin_info);
 
@@ -527,6 +575,16 @@ module aptos_framework::coin {
         let maybe_supply = &mut borrow_global_mut<CoinInfo<CoinType>>(coin_address<CoinType>()).supply;
         if (option::is_some(maybe_supply)) {
             let supply = option::borrow_mut(maybe_supply);
+            spec {
+                use aptos_framework::optional_aggregator;
+                use aptos_framework::aggregator;
+                assume optional_aggregator::is_parallelizable(supply) ==> (aggregator::spec_aggregator_get_val(
+                    option::borrow(supply.aggregator)
+                )
+                    + amount <= aggregator::spec_get_limit(option::borrow(supply.aggregator)));
+                assume !optional_aggregator::is_parallelizable(supply) ==>
+                    (option::borrow(supply.integer).value + amount <= option::borrow(supply.integer).limit);
+            };
             optional_aggregator::add(supply, (amount as u128));
         };
         spec {
@@ -567,7 +625,7 @@ module aptos_framework::coin {
         coin.value
     }
 
-    /// Withdraw specifed `amount` of coin `CoinType` from the signing account.
+    /// Withdraw specified `amount` of coin `CoinType` from the signing account.
     public fun withdraw<CoinType>(
         account: &signer,
         amount: u64,
@@ -584,6 +642,9 @@ module aptos_framework::coin {
             error::permission_denied(EFROZEN),
         );
 
+        if (std::features::module_event_migration_enabled()) {
+            event::emit(Withdraw<CoinType> { account: account_addr, amount });
+        };
         event::emit_event<WithdrawEvent>(
             &mut coin_store.withdraw_events,
             WithdrawEvent { amount },
@@ -878,6 +939,32 @@ module aptos_framework::coin {
         assert!(is_coin_initialized<FakeMoney>(), 1);
 
         move_to(&source, FakeMoneyCapabilities {
+            burn_cap,
+            freeze_cap,
+            mint_cap,
+        });
+    }
+
+    #[test(account = @0x1)]
+    public fun test_is_coin_store_frozen(account: signer) acquires CoinStore {
+        let account_addr = signer::address_of(&account);
+        // An non registered account is has a frozen coin store by default
+        assert!(is_coin_store_frozen<FakeMoney>(account_addr), 1);
+
+        account::create_account_for_test(account_addr);
+        let (burn_cap, freeze_cap, mint_cap) = initialize_and_register_fake_money(&account, 18, true);
+
+        assert!(!is_coin_store_frozen<FakeMoney>(account_addr), 1);
+
+        // freeze account
+        freeze_coin_store(account_addr, &freeze_cap);
+        assert!(is_coin_store_frozen<FakeMoney>(account_addr), 1);
+
+        // unfreeze account
+        unfreeze_coin_store(account_addr, &freeze_cap);
+        assert!(!is_coin_store_frozen<FakeMoney>(account_addr), 1);
+
+        move_to(&account, FakeMoneyCapabilities {
             burn_cap,
             freeze_cap,
             mint_cap,

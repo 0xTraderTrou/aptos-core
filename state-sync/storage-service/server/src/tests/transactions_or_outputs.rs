@@ -61,7 +61,7 @@ async fn test_get_transactions_or_outputs_with_proof() {
                 &output_list_with_proof,
                 &transaction_list_with_proof,
             );
-            let (mut mock_client, mut service, _, _) =
+            let (mut mock_client, mut service, _, _, _) =
                 MockClient::new(Some(db_reader), Some(storage_config));
             utils::update_storage_server_summary(&mut service, proof_version + 100, 10);
             tokio::spawn(service.start());
@@ -137,7 +137,7 @@ async fn test_get_transactions_or_outputs_with_proof_chunk_limit() {
             &output_list_with_proof,
             &transaction_list_with_proof,
         );
-        let (mut mock_client, mut service, _, _) =
+        let (mut mock_client, mut service, _, _, _) =
             MockClient::new(Some(db_reader), Some(storage_config));
         utils::update_storage_server_summary(&mut service, proof_version + chunk_size, 10);
         tokio::spawn(service.start());
@@ -168,7 +168,7 @@ async fn test_get_transactions_or_outputs_with_proof_chunk_limit() {
 #[tokio::test]
 async fn test_get_transactions_or_outputs_with_proof_invalid() {
     // Create the storage client and server
-    let (mut mock_client, service, _, _) = MockClient::new(None, None);
+    let (mut mock_client, service, _, _, _) = MockClient::new(None, None);
     tokio::spawn(service.start());
 
     // Test invalid ranges
@@ -208,7 +208,7 @@ async fn test_get_transactions_or_outputs_with_proof_not_serviceable() {
         let proof_version = end_version;
 
         // Create the storage client and server (that cannot service the request)
-        let (mut mock_client, mut service, _, _) = MockClient::new(None, None);
+        let (mut mock_client, mut service, _, _, _) = MockClient::new(None, None);
         utils::update_storage_server_summary(&mut service, proof_version - 1, 10);
         tokio::spawn(service.start());
 
@@ -311,7 +311,7 @@ async fn get_transactions_or_outputs_with_proof_network_limit(network_limit_byte
                 max_network_chunk_bytes: network_limit_bytes,
                 ..Default::default()
             };
-            let (mut mock_client, mut service, _, _) =
+            let (mut mock_client, mut service, _, _, _) =
                 MockClient::new(Some(db_reader), Some(storage_config));
             utils::update_storage_server_summary(&mut service, proof_version + 100, 10);
             tokio::spawn(service.start());
@@ -339,7 +339,7 @@ async fn get_transactions_or_outputs_with_proof_network_limit(network_limit_byte
 
                     if let Some(transactions_with_proof) = transactions_with_proof {
                         let num_response_bytes =
-                            bcs::to_bytes(&transactions_with_proof).unwrap().len() as u64;
+                            bcs::serialized_size(&transactions_with_proof).unwrap() as u64;
                         let num_transactions = transactions_with_proof.transactions.len() as u64;
                         if num_response_bytes > network_limit_bytes {
                             assert_eq!(num_transactions, 1); // Data cannot be reduced more than a single item
@@ -349,7 +349,7 @@ async fn get_transactions_or_outputs_with_proof_network_limit(network_limit_byte
                         }
                     } else if let Some(outputs_with_proof) = outputs_with_proof {
                         let num_response_bytes =
-                            bcs::to_bytes(&outputs_with_proof).unwrap().len() as u64;
+                            bcs::serialized_size(&outputs_with_proof).unwrap() as u64;
                         let num_outputs = outputs_with_proof.transactions_and_outputs.len() as u64;
                         if num_response_bytes > network_limit_bytes {
                             assert_eq!(num_outputs, 1); // Data cannot be reduced more than a single item

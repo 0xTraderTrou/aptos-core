@@ -22,23 +22,27 @@ module aptos_token::token_transfers {
         claim_events: EventHandle<TokenClaimEvent>,
     }
 
+    #[event]
     struct TokenOfferId has copy, drop, store {
         to_addr: address,
         token_id: TokenId,
     }
 
+    #[event]
     struct TokenOfferEvent has drop, store {
         to_address: address,
         token_id: TokenId,
         amount: u64,
     }
 
+    #[event]
     struct TokenCancelOfferEvent has drop, store {
         to_address: address,
         token_id: TokenId,
         amount: u64,
     }
 
+    #[event]
     struct TokenClaimEvent has drop, store {
         to_address: address,
         token_id: TokenId,
@@ -229,7 +233,7 @@ module aptos_token::token_transfers {
     }
 
     #[test_only]
-    public entry fun create_token(creator: &signer, amount: u64): TokenId {
+    public fun create_token(creator: &signer, amount: u64): TokenId {
         use std::string::{Self, String};
 
         let collection_name = string::utf8(b"Hello, World");

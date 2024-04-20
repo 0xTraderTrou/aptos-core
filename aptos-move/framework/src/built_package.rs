@@ -13,44 +13,63 @@ use aptos_types::{account_address::AccountAddress, transaction::EntryABI};
 use clap::Parser;
 use codespan_reporting::{
     diagnostic::Severity,
-    term::termcolor::{ColorChoice, StandardStream},
+    term::termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor},
 };
 use itertools::Itertools;
 use move_binary_format::CompiledModule;
 use move_command_line_common::files::MOVE_COMPILED_EXTENSION;
 use move_compiler::compiled_unit::{CompiledUnit, NamedCompiledModule};
 use move_core_types::{language_storage::ModuleId, metadata::Metadata};
-use move_model::model::GlobalEnv;
+use move_model::{
+    metadata::{CompilerVersion, LanguageVersion},
+    model::GlobalEnv,
+};
 use move_package::{
     compilation::{compiled_package::CompiledPackage, package_layout::CompiledPackageLayout},
     source_package::manifest_parser::{parse_move_manifest_string, parse_source_manifest},
-    BuildConfig, ModelConfig,
+    BuildConfig, CompilerConfig, ModelConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::stderr,
+    io::{stderr, Write},
     path::{Path, PathBuf},
 };
 
 pub const METADATA_FILE_NAME: &str = "package-metadata.bcs";
 pub const UPGRADE_POLICY_CUSTOM_FIELD: &str = "upgrade_policy";
 
+pub const APTOS_PACKAGES: [&str; 5] = [
+    "AptosFramework",
+    "MoveStdlib",
+    "AptosStdlib",
+    "AptosToken",
+    "AptosTokenObjects",
+];
+
 /// Represents a set of options for building artifacts from Move.
 #[derive(Debug, Clone, Parser, Serialize, Deserialize)]
 pub struct BuildOptions {
+    /// Enables dev mode, which uses all dev-addresses and dev-dependencies
+    ///
+    /// Dev mode allows for changing dependencies and addresses to the preset [dev-addresses] and
+    /// [dev-dependencies] fields.  This works both inside and out of tests for using preset values.
+    ///
+    /// Currently, it also additionally pulls in all test compilation artifacts
+    #[clap(long)]
+    pub dev: bool,
     #[clap(long)]
     pub with_srcs: bool,
     #[clap(long)]
     pub with_abis: bool,
     #[clap(long)]
     pub with_source_maps: bool,
-    #[clap(long, default_value = "true")]
+    #[clap(long, default_value_t = true)]
     pub with_error_map: bool,
     #[clap(long)]
     pub with_docs: bool,
     /// Installation directory for compiled artifacts. Defaults to `<package>/build`.
-    #[clap(long, parse(from_os_str))]
+    #[clap(long, value_parser)]
     pub install_dir: Option<PathBuf>,
     #[clap(skip)] // TODO: have a parser for this; there is one in the CLI buts its  downstream
     pub named_addresses: BTreeMap<String, AccountAddress>,
@@ -60,6 +79,16 @@ pub struct BuildOptions {
     pub skip_fetch_latest_git_deps: bool,
     #[clap(long)]
     pub bytecode_version: Option<u32>,
+    #[clap(long, value_parser = clap::value_parser!(CompilerVersion))]
+    pub compiler_version: Option<CompilerVersion>,
+    #[clap(long, value_parser = clap::value_parser!(LanguageVersion))]
+    pub language_version: Option<LanguageVersion>,
+    #[clap(long)]
+    pub skip_attribute_checks: bool,
+    #[clap(long)]
+    pub check_test_code: bool,
+    #[clap(skip)]
+    pub known_attributes: BTreeSet<String>,
 }
 
 // Because named_addresses has no parser, we can't use clap's default impl. This must be aligned
@@ -67,6 +96,7 @@ pub struct BuildOptions {
 impl Default for BuildOptions {
     fn default() -> Self {
         Self {
+            dev: false,
             with_srcs: false,
             with_abis: false,
             with_source_maps: false,
@@ -79,6 +109,11 @@ impl Default for BuildOptions {
             // while in a test (and cause some havoc)
             skip_fetch_latest_git_deps: false,
             bytecode_version: None,
+            compiler_version: None,
+            language_version: None,
+            skip_attribute_checks: false,
+            check_test_code: false,
+            known_attributes: extended_checks::get_all_attribute_names().clone(),
         }
     }
 }
@@ -88,31 +123,49 @@ impl Default for BuildOptions {
 pub struct BuiltPackage {
     options: BuildOptions,
     package_path: PathBuf,
-    package: CompiledPackage,
+    pub package: CompiledPackage,
 }
 
 pub fn build_model(
+    dev_mode: bool,
     package_path: &Path,
     additional_named_addresses: BTreeMap<String, AccountAddress>,
     target_filter: Option<String>,
     bytecode_version: Option<u32>,
+    compiler_version: Option<CompilerVersion>,
+    language_version: Option<LanguageVersion>,
+    skip_attribute_checks: bool,
+    known_attributes: BTreeSet<String>,
 ) -> anyhow::Result<GlobalEnv> {
     let build_config = BuildConfig {
-        dev_mode: false,
+        dev_mode,
         additional_named_addresses,
         architecture: None,
         generate_abis: false,
         generate_docs: false,
+        generate_move_model: false,
+        full_model_generation: false,
         install_dir: None,
         test_mode: false,
         force_recompilation: false,
         fetch_deps_only: false,
         skip_fetch_latest_git_deps: true,
-        bytecode_version,
+        compiler_config: CompilerConfig {
+            bytecode_version,
+            compiler_version,
+            language_version,
+            skip_attribute_checks,
+            known_attributes,
+        },
     };
+    let compiler_version = compiler_version.unwrap_or_default();
+    let language_version = language_version.unwrap_or_default();
+    compiler_version.check_language_support(language_version)?;
     build_config.move_model_for_package(package_path, ModelConfig {
         target_filter,
         all_files_as_targets: false,
+        compiler_version,
+        language_version,
     })
 }
 
@@ -123,30 +176,38 @@ impl BuiltPackage {
     /// and is not `Ok` if there was an error among those.
     pub fn build(package_path: PathBuf, options: BuildOptions) -> anyhow::Result<Self> {
         let bytecode_version = options.bytecode_version;
+        let compiler_version = options.compiler_version;
+        let language_version = options.language_version;
+        Self::check_versions(&compiler_version, &language_version)?;
+        let skip_attribute_checks = options.skip_attribute_checks;
         let build_config = BuildConfig {
-            dev_mode: false,
+            dev_mode: options.dev,
             additional_named_addresses: options.named_addresses.clone(),
             architecture: None,
             generate_abis: options.with_abis,
             generate_docs: false,
+            generate_move_model: true,
+            full_model_generation: options.check_test_code,
             install_dir: options.install_dir.clone(),
             test_mode: false,
             force_recompilation: false,
             fetch_deps_only: false,
             skip_fetch_latest_git_deps: options.skip_fetch_latest_git_deps,
-            bytecode_version,
+            compiler_config: CompilerConfig {
+                bytecode_version,
+                compiler_version,
+                language_version,
+                skip_attribute_checks,
+                known_attributes: options.known_attributes.clone(),
+            },
         };
-        eprintln!("Compiling, may take a little while to download git dependencies...");
-        let mut package = build_config.compile_package_no_exit(&package_path, &mut stderr())?;
 
-        // Build the Move model for extra processing and run extended checks as well derive
-        // runtime metadata
-        let model = &build_model(
-            package_path.as_path(),
-            options.named_addresses.clone(),
-            None,
-            bytecode_version,
-        )?;
+        eprintln!("Compiling, may take a little while to download git dependencies...");
+        let (mut package, model_opt) =
+            build_config.compile_package_no_exit(&package_path, &mut stderr())?;
+
+        // Run extended checks as well derive runtime metadata
+        let model = &model_opt.expect("move model");
         let runtime_metadata = extended_checks::run_extended_checks(model);
         if model.diag_count(Severity::Warning) > 0 {
             let mut error_writer = StandardStream::stderr(ColorChoice::Auto);
@@ -155,10 +216,17 @@ impl BuiltPackage {
                 bail!("extended checks failed")
             }
         }
+
+        let compiled_pkg_path = package
+            .compiled_package_info
+            .build_flags
+            .install_dir
+            .as_ref()
+            .unwrap_or(&package_path)
+            .join(CompiledPackageLayout::Root.path())
+            .join(package.compiled_package_info.package_name.as_str());
         inject_runtime_metadata(
-            package_path
-                .join(CompiledPackageLayout::Root.path())
-                .join(package.compiled_package_info.package_name.as_str()),
+            compiled_pkg_path,
             &mut package,
             runtime_metadata,
             bytecode_version,
@@ -194,6 +262,35 @@ impl BuiltPackage {
             package_path,
             package,
         })
+    }
+
+    // Check versions and warn user if using unstable ones.
+    fn check_versions(
+        compiler_version: &Option<CompilerVersion>,
+        language_version: &Option<LanguageVersion>,
+    ) -> anyhow::Result<()> {
+        let effective_compiler_version = compiler_version.unwrap_or_default();
+        let effective_language_version = language_version.unwrap_or_default();
+        let mut error_writer = StandardStream::stderr(ColorChoice::Auto);
+        error_writer.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)))?;
+        if effective_compiler_version.unstable() {
+            writeln!(
+                &mut error_writer,
+                "Warning: compiler version `{}` is experimental \
+                and should not be used in production",
+                effective_compiler_version
+            )?
+        }
+        if effective_language_version.unstable() {
+            writeln!(
+                &mut error_writer,
+                "Warning: language version `{}` is experimental \
+                and should not be used in production",
+                effective_language_version
+            )?
+        }
+        effective_compiler_version.check_language_support(effective_language_version)?;
+        Ok(())
     }
 
     /// Returns the name of this package.
@@ -236,6 +333,17 @@ impl BuiltPackage {
     pub fn modules(&self) -> impl Iterator<Item = &CompiledModule> {
         self.package
             .root_modules()
+            .filter_map(|unit| match &unit.unit {
+                CompiledUnit::Module(NamedCompiledModule { module, .. }) => Some(module),
+                CompiledUnit::Script(_) => None,
+            })
+    }
+
+    /// Returns an iterator for all compiled proper (non-script) modules, including
+    /// modules that are dependencies of the root modules.
+    pub fn all_modules(&self) -> impl Iterator<Item = &CompiledModule> {
+        self.package
+            .all_modules()
             .filter_map(|unit| match &unit.unit {
                 CompiledUnit::Module(NamedCompiledModule { module, .. }) => Some(module),
                 CompiledUnit::Script(_) => None,

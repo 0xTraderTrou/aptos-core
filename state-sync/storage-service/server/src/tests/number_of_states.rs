@@ -3,6 +3,7 @@
 
 use crate::tests::{mock, mock::MockClient, utils};
 use anyhow::format_err;
+use aptos_storage_interface::AptosDbError;
 use aptos_storage_service_types::{
     responses::{DataResponse, StorageServiceResponse},
     StorageServiceError,
@@ -25,7 +26,7 @@ async fn test_get_number_of_states_at_version() {
         .returning(move |_| Ok(number_of_states as usize));
 
     // Create the storage client and server
-    let (mut mock_client, mut service, _, _) = MockClient::new(Some(db_reader), None);
+    let (mut mock_client, mut service, _, _, _) = MockClient::new(Some(db_reader), None);
     utils::update_storage_server_summary(&mut service, version, 10);
     tokio::spawn(service.start());
 
@@ -48,7 +49,7 @@ async fn test_get_number_of_states_at_version_not_serviceable() {
     let version = 101;
 
     // Create the storage client and server (that cannot service the request)
-    let (mut mock_client, mut service, _, _) = MockClient::new(None, None);
+    let (mut mock_client, mut service, _, _, _) = MockClient::new(None, None);
     utils::update_storage_server_summary(&mut service, version - 1, 10);
     tokio::spawn(service.start());
 
@@ -72,10 +73,14 @@ async fn test_get_number_of_states_at_version_invalid() {
         .expect_get_state_leaf_count()
         .times(1)
         .with(eq(version))
-        .returning(move |_| Err(format_err!("Version does not exist!")));
+        .returning(move |_| {
+            Err(AptosDbError::NotFound(
+                format_err!("Version does not exist!").to_string(),
+            ))
+        });
 
     // Create the storage client and server
-    let (mut mock_client, mut service, _, _) = MockClient::new(Some(db_reader), None);
+    let (mut mock_client, mut service, _, _, _) = MockClient::new(Some(db_reader), None);
     utils::update_storage_server_summary(&mut service, version, 10);
     tokio::spawn(service.start());
 

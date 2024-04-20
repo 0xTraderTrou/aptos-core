@@ -1,5 +1,5 @@
 
-<a name="0x1_debug"></a>
+<a id="0x1_debug"></a>
 
 # Module `0x1::debug`
 
@@ -13,6 +13,8 @@ Module providing debug functionality.
 -  [Function `native_print`](#0x1_debug_native_print)
 -  [Function `native_stack_trace`](#0x1_debug_native_stack_trace)
 -  [Specification](#@Specification_1)
+    -  [Function `print`](#@Specification_1_print)
+    -  [Function `print_stack_trace`](#@Specification_1_print_stack_trace)
     -  [Function `native_print`](#@Specification_1_native_print)
     -  [Function `native_stack_trace`](#@Specification_1_native_stack_trace)
 
@@ -23,12 +25,12 @@ Module providing debug functionality.
 
 
 
-<a name="@Constants_0"></a>
+<a id="@Constants_0"></a>
 
 ## Constants
 
 
-<a name="0x1_debug_MSG_1"></a>
+<a id="0x1_debug_MSG_1"></a>
 
 
 
@@ -37,7 +39,7 @@ Module providing debug functionality.
 
 
 
-<a name="0x1_debug_MSG_2"></a>
+<a id="0x1_debug_MSG_2"></a>
 
 
 
@@ -46,7 +48,7 @@ Module providing debug functionality.
 
 
 
-<a name="0x1_debug_print"></a>
+<a id="0x1_debug_print"></a>
 
 ## Function `print`
 
@@ -70,7 +72,7 @@ Module providing debug functionality.
 
 </details>
 
-<a name="0x1_debug_print_stack_trace"></a>
+<a id="0x1_debug_print_stack_trace"></a>
 
 ## Function `print_stack_trace`
 
@@ -94,7 +96,7 @@ Module providing debug functionality.
 
 </details>
 
-<a name="0x1_debug_format"></a>
+<a id="0x1_debug_format"></a>
 
 ## Function `format`
 
@@ -118,7 +120,7 @@ Module providing debug functionality.
 
 </details>
 
-<a name="0x1_debug_native_print"></a>
+<a id="0x1_debug_native_print"></a>
 
 ## Function `native_print`
 
@@ -140,7 +142,7 @@ Module providing debug functionality.
 
 </details>
 
-<a name="0x1_debug_native_stack_trace"></a>
+<a id="0x1_debug_native_stack_trace"></a>
 
 ## Function `native_stack_trace`
 
@@ -162,12 +164,44 @@ Module providing debug functionality.
 
 </details>
 
-<a name="@Specification_1"></a>
+<a id="@Specification_1"></a>
 
 ## Specification
 
 
-<a name="@Specification_1_native_print"></a>
+<a id="@Specification_1_print"></a>
+
+### Function `print`
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="debug.md#0x1_debug_print">print</a>&lt;T&gt;(x: &T)
+</code></pre>
+
+
+
+
+<pre><code><b>aborts_if</b> <b>false</b>;
+</code></pre>
+
+
+
+<a id="@Specification_1_print_stack_trace"></a>
+
+### Function `print_stack_trace`
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="debug.md#0x1_debug_print_stack_trace">print_stack_trace</a>()
+</code></pre>
+
+
+
+
+<pre><code><b>aborts_if</b> <b>false</b>;
+</code></pre>
+
+
+
+<a id="@Specification_1_native_print"></a>
 
 ### Function `native_print`
 
@@ -179,11 +213,12 @@ Module providing debug functionality.
 
 
 <pre><code><b>pragma</b> opaque;
+<b>aborts_if</b> <b>false</b>;
 </code></pre>
 
 
 
-<a name="@Specification_1_native_stack_trace"></a>
+<a id="@Specification_1_native_stack_trace"></a>
 
 ### Function `native_stack_trace`
 
@@ -195,7 +230,8 @@ Module providing debug functionality.
 
 
 <pre><code><b>pragma</b> opaque;
+<b>aborts_if</b> <b>false</b>;
 </code></pre>
 
 
-[move-book]: https://aptos.dev/guides/move-guides/book/SUMMARY
+[move-book]: https://aptos.dev/move/book/SUMMARY

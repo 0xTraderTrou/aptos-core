@@ -2,14 +2,13 @@
 // Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use aptos_crypto::{ed25519::Ed25519PrivateKey, HashValue, PrivateKey};
-use aptos_gas::{FeePerGasUnit, Gas, NumBytes};
+use aptos_crypto::HashValue;
+use aptos_gas_algebra::{FeePerGasUnit, Gas, NumBytes};
 use aptos_types::{
     account_address::AccountAddress,
     chain_id::ChainId,
-    transaction::{authenticator::AuthenticationKey, SignedTransaction, TransactionPayload},
+    transaction::{SignedTransaction, TransactionPayload},
 };
-use std::convert::TryFrom;
 
 pub struct TransactionMetadata {
     pub sender: AccountAddress,
@@ -17,6 +16,8 @@ pub struct TransactionMetadata {
     pub secondary_signers: Vec<AccountAddress>,
     pub secondary_authentication_keys: Vec<Vec<u8>>,
     pub sequence_number: u64,
+    pub fee_payer: Option<AccountAddress>,
+    pub fee_payer_authentication_key: Option<Vec<u8>>,
     pub max_gas_amount: Gas,
     pub gas_unit_price: FeePerGasUnit,
     pub transaction_size: NumBytes,
@@ -24,6 +25,7 @@ pub struct TransactionMetadata {
     pub chain_id: ChainId,
     pub script_hash: Vec<u8>,
     pub script_size: NumBytes,
+    pub required_deposit: Option<u64>,
 }
 
 impl TransactionMetadata {
@@ -31,7 +33,7 @@ impl TransactionMetadata {
         Self {
             sender: txn.sender(),
             authentication_key: txn.authenticator().sender().authentication_key().to_vec(),
-            secondary_signers: txn.authenticator().secondary_signer_addreses(),
+            secondary_signers: txn.authenticator().secondary_signer_addresses(),
             secondary_authentication_keys: txn
                 .authenticator()
                 .secondary_signers()
@@ -39,6 +41,11 @@ impl TransactionMetadata {
                 .map(|account_auth| account_auth.authentication_key().to_vec())
                 .collect(),
             sequence_number: txn.sequence_number(),
+            fee_payer: txn.authenticator_ref().fee_payer_address(),
+            fee_payer_authentication_key: txn
+                .authenticator()
+                .fee_payer_signer()
+                .map(|signer| signer.authentication_key().to_vec()),
             max_gas_amount: txn.max_gas_amount().into(),
             gas_unit_price: txn.gas_unit_price().into(),
             transaction_size: (txn.raw_txn_bytes_len() as u64).into(),
@@ -49,13 +56,15 @@ impl TransactionMetadata {
                 TransactionPayload::EntryFunction(_) => vec![],
                 TransactionPayload::Multisig(_) => vec![],
 
-                // Deprecated. Will be removed in the future.
+                // Deprecated. Return an empty vec because we cannot do anything
+                // else here, only `unreachable!` otherwise.
                 TransactionPayload::ModuleBundle(_) => vec![],
             },
             script_size: match txn.payload() {
                 TransactionPayload::Script(s) => (s.code().len() as u64).into(),
                 _ => NumBytes::zero(),
             },
+            required_deposit: None,
         }
     }
 
@@ -65,6 +74,10 @@ impl TransactionMetadata {
 
     pub fn gas_unit_price(&self) -> FeePerGasUnit {
         self.gas_unit_price
+    }
+
+    pub fn fee_payer(&self) -> Option<AccountAddress> {
+        self.fee_payer.to_owned()
     }
 
     pub fn script_size(&self) -> NumBytes {
@@ -77,6 +90,12 @@ impl TransactionMetadata {
 
     pub fn secondary_signers(&self) -> Vec<AccountAddress> {
         self.secondary_signers.to_owned()
+    }
+
+    pub fn senders(&self) -> Vec<AccountAddress> {
+        let mut senders = vec![self.sender()];
+        senders.extend(self.secondary_signers());
+        senders
     }
 
     pub fn authentication_key(&self) -> &[u8] {
@@ -100,28 +119,10 @@ impl TransactionMetadata {
     }
 
     pub fn is_multi_agent(&self) -> bool {
-        !self.secondary_signers.is_empty()
+        !self.secondary_signers.is_empty() || self.fee_payer.is_some()
     }
-}
 
-impl Default for TransactionMetadata {
-    fn default() -> Self {
-        let mut buf = [0u8; Ed25519PrivateKey::LENGTH];
-        buf[Ed25519PrivateKey::LENGTH - 1] = 1;
-        let public_key = Ed25519PrivateKey::try_from(&buf[..]).unwrap().public_key();
-        TransactionMetadata {
-            sender: AccountAddress::ZERO,
-            authentication_key: AuthenticationKey::ed25519(&public_key).to_vec(),
-            secondary_signers: vec![],
-            secondary_authentication_keys: vec![],
-            sequence_number: 0,
-            max_gas_amount: 100_000_000.into(),
-            gas_unit_price: 0.into(),
-            transaction_size: 0.into(),
-            expiration_timestamp_secs: 0,
-            chain_id: ChainId::test(),
-            script_hash: vec![],
-            script_size: NumBytes::zero(),
-        }
+    pub fn set_required_deposit(&mut self, required_deposit: Option<u64>) {
+        self.required_deposit = required_deposit;
     }
 }

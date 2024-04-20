@@ -1,12 +1,13 @@
 // Copyright © Aptos Foundation
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{components::ProposalMetadata, ExecutionMode, ReleaseConfig};
+use crate::{aptos_framework_path, components::ProposalMetadata, ExecutionMode, ReleaseConfig};
 use anyhow::Result;
 use aptos::{
     common::types::CliCommand,
     governance::{ExecuteProposal, SubmitProposal, SubmitVote},
     move_tool::{RunFunction, RunScript},
+    stake::IncreaseLockup,
 };
 use aptos_api_types::U64;
 use aptos_crypto::ed25519::Ed25519PrivateKey;
@@ -41,13 +42,6 @@ struct CreateProposalEvent {
     proposal_id: U64,
 }
 
-fn aptos_framework_path() -> PathBuf {
-    let mut path = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
-    path.pop();
-    path.push("framework/aptos-framework");
-    path
-}
-
 impl NetworkConfig {
     pub fn new_from_dir(endpoint: Url, test_dir: &Path) -> Result<Self> {
         let root_key_path = test_dir.join("mint.key");
@@ -62,6 +56,16 @@ impl NetworkConfig {
             validator_key: private_identity.account_private_key,
             framework_git_rev: None,
         })
+    }
+
+    // ED25519 Private keys have a very silly to_string that returns what looks
+    // like a debug output:
+    //   <elided secret for Ed25519PrivateKey>
+    // Which is almost never what you want unless you're debugging...
+    // Usually you want the hex encoded version, although you wanna be careful
+    // you're not accidentally leaking private keys, but thats a separate issue
+    pub fn get_hex_encoded_validator_key(&self) -> String {
+        hex::encode(self.validator_key.to_bytes())
     }
 
     /// Submit all govenerance proposal script inside script_path to the corresponding rest endpoint.
@@ -167,7 +171,7 @@ impl NetworkConfig {
             args.push(framework_path.as_os_str().to_str().unwrap());
         };
 
-        RunScript::parse_from(args).execute().await?;
+        RunScript::try_parse_from(args)?.execute().await?;
         Ok(())
     }
 
@@ -180,7 +184,7 @@ impl NetworkConfig {
         println!("Creating proposal: {:?}", script_path);
 
         let address_string = format!("{}", self.validator_account);
-        let privkey_string = hex::encode(self.validator_key.to_bytes());
+        let privkey_string = self.get_hex_encoded_validator_key();
 
         let metadata_path = TempPath::new();
         metadata_path.create_as_file()?;
@@ -217,11 +221,11 @@ impl NetworkConfig {
         if let Some(rev) = &rev_string {
             args.push("--framework-git-rev");
             args.push(rev.as_str());
-            SubmitProposal::parse_from(args).execute().await?;
+            SubmitProposal::try_parse_from(args)?.execute().await?;
         } else {
             args.push("--framework-local-dir");
             args.push(framework_path.as_os_str().to_str().unwrap());
-            SubmitProposal::parse_from(args).execute().await?;
+            SubmitProposal::try_parse_from(args)?.execute().await?;
         };
 
         // Get proposal id.
@@ -247,7 +251,7 @@ impl NetworkConfig {
         println!("Voting proposal id {:?}", proposal_id);
 
         let address_string = format!("{}", self.validator_account);
-        let privkey_string = hex::encode(self.validator_key.to_bytes());
+        let privkey_string = self.get_hex_encoded_validator_key();
         let proposal_id = format!("{}", proposal_id);
 
         let args = vec![
@@ -266,7 +270,7 @@ impl NetworkConfig {
             self.endpoint.as_str(),
         ];
 
-        SubmitVote::parse_from(args).execute().await?;
+        SubmitVote::try_parse_from(args)?.execute().await?;
         Ok(())
     }
 
@@ -292,7 +296,7 @@ impl NetworkConfig {
             self.endpoint.as_str(),
         ];
 
-        RunFunction::parse_from(args).execute().await?;
+        RunFunction::try_parse_from(args)?.execute().await?;
         Ok(())
     }
 
@@ -315,7 +319,7 @@ impl NetworkConfig {
             "--url",
             self.endpoint.as_str(),
         ];
-        RunFunction::parse_from(args).execute().await?;
+        RunFunction::try_parse_from(args)?.execute().await?;
         Ok(())
     }
 
@@ -326,7 +330,7 @@ impl NetworkConfig {
         );
 
         let address_string = format!("{}", self.validator_account);
-        let privkey_string = hex::encode(self.validator_key.to_bytes());
+        let privkey_string = self.get_hex_encoded_validator_key();
         let proposal_id = format!("{}", proposal_id);
 
         let mut args = vec![
@@ -357,7 +361,26 @@ impl NetworkConfig {
             args.push(framework_path.as_os_str().to_str().unwrap());
         };
 
-        ExecuteProposal::parse_from(args).execute().await?;
+        ExecuteProposal::try_parse_from(args)?.execute().await?;
+        Ok(())
+    }
+
+    async fn increase_lockup(&self) -> Result<()> {
+        let validator_account = self.validator_account.to_string();
+        let validator_key = self.get_hex_encoded_validator_key();
+        let args = vec![
+            // Ahhhhh this first empty string is very important
+            // parse_from requires argv[0]
+            "",
+            "--sender-account",
+            validator_account.as_str(),
+            "--private-key",
+            validator_key.as_str(),
+            "--url",
+            self.endpoint.as_str(),
+            "--assume-yes",
+        ];
+        IncreaseLockup::try_parse_from(args)?.execute().await?;
         Ok(())
     }
 }
@@ -366,20 +389,23 @@ async fn execute_release(
     release_config: ReleaseConfig,
     network_config: NetworkConfig,
     output_dir: Option<PathBuf>,
+    validate_release: bool,
 ) -> Result<()> {
     let scripts_path = TempPath::new();
     scripts_path.create_as_dir()?;
 
-    release_config.generate_release_proposal_scripts(
-        if let Some(dir) = &output_dir {
-            dir.as_path()
-        } else {
-            scripts_path.path()
-        },
-    )?;
+    let proposal_folder = if let Some(dir) = &output_dir {
+        dir.as_path()
+    } else {
+        scripts_path.path()
+    };
+    release_config.generate_release_proposal_scripts(proposal_folder)?;
 
-    for proposal in release_config.proposals {
-        let mut proposal_path = scripts_path.path().to_path_buf();
+    network_config.increase_lockup().await?;
+
+    // Execute proposals
+    for proposal in &release_config.proposals {
+        let mut proposal_path = proposal_folder.to_path_buf();
         proposal_path.push("sources");
         proposal_path.push(&release_config.name);
         proposal_path.push(proposal.name.as_str());
@@ -405,14 +431,6 @@ async fn execute_release(
                     .submit_and_execute_multi_step_proposal(&proposal.metadata, script_paths)
                     .await?;
 
-                network_config.set_fast_resolve(43200).await?;
-            },
-            ExecutionMode::SingleStep => {
-                network_config.set_fast_resolve(30).await?;
-                // Single step governance proposal;
-                network_config
-                    .submit_and_execute_proposal(&proposal.metadata, script_paths)
-                    .await?;
                 network_config.set_fast_resolve(43200).await?;
             },
             ExecutionMode::RootSigner => {
@@ -443,10 +461,13 @@ async fn execute_release(
                         args.push(framework_path.as_os_str().to_str().unwrap());
                     };
 
-                    RunScript::parse_from(args).execute().await?;
+                    RunScript::try_parse_from(args)?.execute().await?;
                 }
             },
         };
+        if validate_release {
+            release_config.validate_upgrade(&network_config.endpoint, proposal)?;
+        }
     }
     Ok(())
 }
@@ -463,6 +484,42 @@ pub async fn validate_config_and_generate_release(
     network_config: NetworkConfig,
     output_dir: Option<PathBuf>,
 ) -> Result<()> {
-    execute_release(release_config.clone(), network_config.clone(), output_dir).await?;
-    release_config.validate_upgrade(network_config.endpoint)
+    execute_release(
+        release_config.clone(),
+        network_config.clone(),
+        output_dir,
+        true,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub mod test {
+    use super::NetworkConfig;
+    use aptos_crypto::PrivateKey;
+    use aptos_keygen::KeyGen;
+    use aptos_types::transaction::authenticator::AuthenticationKey;
+
+    #[tokio::test]
+    pub async fn test_network_config() {
+        let seed_slice = [0u8; 32];
+        let mut keygen = KeyGen::from_seed(seed_slice);
+        let validator_key = keygen.generate_ed25519_private_key();
+        let validator_account =
+            AuthenticationKey::ed25519(&validator_key.public_key()).account_address();
+
+        let network_info = NetworkConfig {
+            endpoint: "https://banana.com/".parse().unwrap(),
+            root_key_path: "".into(),
+            validator_account,
+            validator_key,
+            framework_git_rev: None,
+        };
+
+        let private_key_string = network_info.get_hex_encoded_validator_key();
+        assert_eq!(
+            private_key_string.as_str(),
+            "76b8e0ada0f13d90405d6ae55386bd28bdd219b8a08ded1aa836efcc8b770dc7"
+        );
+    }
 }

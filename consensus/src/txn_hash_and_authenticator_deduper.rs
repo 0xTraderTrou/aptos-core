@@ -5,6 +5,7 @@ use crate::{
     counters::{TXN_DEDUP_FILTERED, TXN_DEDUP_SECONDS},
     transaction_deduper::TransactionDeduper,
 };
+use aptos_experimental_runtimes::thread_manager::optimal_min_len;
 use aptos_types::transaction::SignedTransaction;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -57,10 +58,12 @@ impl TransactionDeduper for TxnHashAndAuthenticatorDeduper {
             return transactions;
         }
 
+        let num_txns = transactions.len();
+
         let hash_and_authenticators: Vec<_> = possible_duplicates
             .into_par_iter()
             .zip(&transactions)
-            .with_min_len(25)
+            .with_min_len(optimal_min_len(num_txns, 48))
             .map(|(need_hash, txn)| match need_hash {
                 true => Some((txn.clone().committed_hash(), txn.authenticator())),
                 false => None,
@@ -282,7 +285,6 @@ mod tests {
 
         let sender = Account::new();
         let txns: Vec<_> = (0..PERF_TXN_PER_BLOCK)
-            .into_iter()
             .map(|i| {
                 empty_txn(sender.addr, i as u64, 100)
                     .sign(&sender.privkey, sender.pubkey.clone())
@@ -324,7 +326,6 @@ mod tests {
         let sender = Account::new();
         let receiver = Account::new();
         let txns: Vec<_> = (0..PERF_TXN_PER_BLOCK)
-            .into_iter()
             .map(|i| {
                 peer_to_peer_txn(sender.addr, receiver.addr, i as u64, 100)
                     .sign(&sender.privkey, sender.pubkey.clone())

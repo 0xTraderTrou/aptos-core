@@ -4,13 +4,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-This script is how we orchestrate running a local testnet and then the faucet
+This script is how we orchestrate running a localnet and then the faucet
 integration tests against it.
 
 Example invocation:
   python3 main.py --local-testnet-network devnet
 
-This would run a local testnet built from the devnet release branch and then run the
+This would run a localnet built from the devnet release branch and then run the
 faucet integration tests against it.
 
 The script confirms that pre-existing conditions are suitable, e.g. checking that a
@@ -20,10 +20,11 @@ Redis instance is alive.
 import argparse
 import logging
 import os
+import platform
 import shutil
 import sys
 
-from common import Network
+from common import VALID_NETWORK_OPTIONS, Network, network_from_str
 from local_testnet import run_node, stop_node, wait_for_startup
 from prechecks import check_redis_is_running
 from tests import run_faucet_integration_tests
@@ -49,7 +50,7 @@ def parse_args():
         "--image-repo-with-project",
         default="aptoslabs",
         help=(
-            "What docker image repo (+ project) to use for the local testnet. "
+            "What docker image repo (+ project) to use for the localnet. "
             "By default we use Docker Hub: %(default)s (so, just aptoslabs for the "
             "project since Docker Hub is the implied default repo). If you want to "
             "specify a different repo, it might look like this: "
@@ -59,9 +60,18 @@ def parse_args():
     parser.add_argument(
         "--base-network",
         required=True,
-        type=Network,
-        choices=list(Network),
-        help="What branch the Aptos CLI used for the local testnet should be built from",
+        choices=VALID_NETWORK_OPTIONS,
+        help=(
+            "What branch the Aptos CLI used for the localnet should be built "
+            'from. If "custom", --tag must be set.'
+        ),
+    )
+    parser.add_argument(
+        "--tag",
+        help=(
+            'If --base-network is set to "custom", this must be set to the image tag'
+            "to use. Otherwise this has no effect."
+        ),
     )
     parser.add_argument(
         "--base-startup-timeout",
@@ -87,13 +97,26 @@ def main():
     else:
         logging.getLogger().setLevel(logging.INFO)
 
+    # If we're on Mac and DOCKER_DEFAULT_PLATFORM is not already set, set it to
+    # linux/amd64 since we only publish images for that platform.
+    if platform.system().lower() == "darwin" and platform.processor().lower().startswith("arm"):
+        if not os.environ.get("DOCKER_DEFAULT_PLATFORM"):
+            os.environ["DOCKER_DEFAULT_PLATFORM"] = "linux/amd64"
+            LOG.info(
+                "Detected ARM Mac and DOCKER_DEFAULT_PLATFORM was not set, setting it "
+                "to linux/amd64"
+            )
+
+    # Build the Network.
+    network = network_from_str(args.base_network, args.tag)
+
     # Verify that a local Redis instance is running. This is just a basic check that
     # something is listening at the expected port.
     check_redis_is_running()
 
     # Run a node and wait for it to start up.
     container_name = run_node(
-        args.base_network, args.image_repo_with_project, args.external_test_dir
+        network, args.image_repo_with_project, args.external_test_dir
     )
     wait_for_startup(container_name, args.base_startup_timeout)
 
@@ -103,7 +126,7 @@ def main():
     # Build and run the faucet integration tests.
     run_faucet_integration_tests()
 
-    # Stop the local testnet.
+    # Stop the localnet.
     stop_node(container_name)
 
     return True

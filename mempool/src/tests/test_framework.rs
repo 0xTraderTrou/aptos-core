@@ -23,7 +23,7 @@ use aptos_network::{
         storage::PeersAndMetadata,
     },
     peer_manager::{
-        conn_notifs_channel, ConnectionRequestSender, PeerManagerNotification, PeerManagerRequest,
+        ConnectionRequestSender, PeerManagerNotification, PeerManagerRequest,
         PeerManagerRequestSender,
     },
     protocols::{
@@ -43,11 +43,14 @@ use aptos_network::{
 };
 use aptos_storage_interface::mock::MockDbReaderWriter;
 use aptos_types::{
-    account_address::AccountAddress, mempool_status::MempoolStatusCode,
-    on_chain_config::OnChainConfigPayload, transaction::SignedTransaction,
+    account_address::AccountAddress,
+    mempool_status::MempoolStatusCode,
+    on_chain_config::{InMemoryOnChainConfig, OnChainConfigPayload},
+    transaction::SignedTransaction,
 };
 use aptos_vm_validator::mocks::mock_vm_validator::MockVMValidator;
 use futures::{channel::oneshot, SinkExt};
+use maplit::btreemap;
 use std::{collections::HashMap, hash::Hash, sync::Arc};
 use tokio::{runtime::Handle, time::Duration};
 use tokio_stream::StreamExt;
@@ -168,7 +171,7 @@ impl MempoolNode {
             let block = self
                 .mempool
                 .lock()
-                .get_batch(100, 102400, true, false, vec![]);
+                .get_batch(100, 102400, true, false, btreemap![]);
 
             if block_contains_all_transactions(&block, txns) {
                 break;
@@ -221,7 +224,7 @@ impl MempoolNode {
         let block = self
             .mempool
             .lock()
-            .get_batch(100, 102400, true, false, vec![]);
+            .get_batch(100, 102400, true, false, btreemap![]);
         if !condition(&block, txns) {
             let actual: Vec<_> = block
                 .iter()
@@ -453,7 +456,12 @@ impl TestFramework<MempoolNode> for MempoolTestFramework {
             peers_and_metadata,
         ) = setup_node_networks(&network_ids);
         let (mempool_client_sender, consensus_to_mempool_sender, mempool_notifications, mempool) =
-            setup_mempool(config, network_client, network_service_events);
+            setup_mempool(
+                config,
+                network_client,
+                network_service_events,
+                peers_and_metadata.clone(),
+            );
 
         MempoolNode {
             node_id,
@@ -532,21 +540,19 @@ fn setup_network(
     let (reqs_inbound_sender, reqs_inbound_receiver) = aptos_channel();
     let (reqs_outbound_sender, reqs_outbound_receiver) = aptos_channel();
     let (connection_outbound_sender, _connection_outbound_receiver) = aptos_channel();
-    let (connection_inbound_sender, connection_inbound_receiver) = conn_notifs_channel::new();
 
     // Create the network sender and events
     let network_sender = NetworkSender::new(
         PeerManagerRequestSender::new(reqs_outbound_sender),
         ConnectionRequestSender::new(connection_outbound_sender),
     );
-    let network_events = NetworkEvents::new(reqs_inbound_receiver, connection_inbound_receiver);
+    let network_events = NetworkEvents::new(reqs_inbound_receiver, None);
 
     (
         network_sender,
         network_events,
         InboundNetworkHandle {
             inbound_message_sender: reqs_inbound_sender,
-            connection_update_sender: connection_inbound_sender,
             peers_and_metadata,
         },
         reqs_outbound_receiver,
@@ -565,6 +571,7 @@ fn setup_mempool(
     config: NodeConfig,
     network_client: NetworkClient<MempoolSyncMsg>,
     network_service_events: NetworkServiceEvents<MempoolSyncMsg>,
+    peers_and_metadata: Arc<PeersAndMetadata>,
 ) -> (
     MempoolClientSender,
     futures::channel::mpsc::Sender<QuorumStoreRequest>,
@@ -575,7 +582,7 @@ fn setup_mempool(
     let (ac_endpoint_sender, ac_endpoint_receiver) = mpsc_channel();
     let (quorum_store_sender, quorum_store_receiver) = mpsc_channel();
     let (mempool_notifier, mempool_listener) =
-        aptos_mempool_notifications::new_mempool_notifier_listener_pair();
+        aptos_mempool_notifications::new_mempool_notifier_listener_pair(100);
 
     let mempool = Arc::new(Mutex::new(CoreMempool::new(&config)));
     let vm_validator = Arc::new(RwLock::new(MockVMValidator));
@@ -588,7 +595,10 @@ fn setup_mempool(
     reconfig_sender
         .push((), ReconfigNotification {
             version: 1,
-            on_chain_configs: OnChainConfigPayload::new(1, Arc::new(HashMap::new())),
+            on_chain_configs: OnChainConfigPayload::new(
+                1,
+                InMemoryOnChainConfig::new(HashMap::new()),
+            ),
         })
         .unwrap();
 
@@ -605,6 +615,7 @@ fn setup_mempool(
         db_ro,
         vm_validator,
         vec![sender],
+        peers_and_metadata,
     );
 
     (

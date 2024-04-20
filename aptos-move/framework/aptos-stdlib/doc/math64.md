@@ -1,5 +1,5 @@
 
-<a name="0x1_math64"></a>
+<a id="0x1_math64"></a>
 
 # Module `0x1::math64`
 
@@ -10,6 +10,7 @@ Standard math utilities missing in the Move Language.
 -  [Function `max`](#0x1_math64_max)
 -  [Function `min`](#0x1_math64_min)
 -  [Function `average`](#0x1_math64_average)
+-  [Function `gcd`](#0x1_math64_gcd)
 -  [Function `mul_div`](#0x1_math64_mul_div)
 -  [Function `clamp`](#0x1_math64_clamp)
 -  [Function `pow`](#0x1_math64_pow)
@@ -17,12 +18,14 @@ Standard math utilities missing in the Move Language.
 -  [Function `log2`](#0x1_math64_log2)
 -  [Function `sqrt`](#0x1_math64_sqrt)
 -  [Function `ceil_div`](#0x1_math64_ceil_div)
--  [Function `assert_approx_the_same`](#0x1_math64_assert_approx_the_same)
 -  [Specification](#@Specification_1)
     -  [Function `max`](#@Specification_1_max)
     -  [Function `min`](#@Specification_1_min)
     -  [Function `average`](#@Specification_1_average)
+    -  [Function `clamp`](#@Specification_1_clamp)
     -  [Function `pow`](#@Specification_1_pow)
+    -  [Function `floor_log2`](#@Specification_1_floor_log2)
+    -  [Function `sqrt`](#@Specification_1_sqrt)
 
 
 <pre><code><b>use</b> <a href="../../move-stdlib/doc/error.md#0x1_error">0x1::error</a>;
@@ -31,23 +34,14 @@ Standard math utilities missing in the Move Language.
 
 
 
-<a name="@Constants_0"></a>
+<a id="@Constants_0"></a>
 
 ## Constants
 
 
-<a name="0x1_math64_EDIVISION_BY_ZERO"></a>
+<a id="0x1_math64_EINVALID_ARG_FLOOR_LOG2"></a>
 
-
-
-<pre><code><b>const</b> <a href="math64.md#0x1_math64_EDIVISION_BY_ZERO">EDIVISION_BY_ZERO</a>: u64 = 1;
-</code></pre>
-
-
-
-<a name="0x1_math64_EINVALID_ARG_FLOOR_LOG2"></a>
-
-Abort value when an invalid argument is provided.
+Cannot log2 the value 0
 
 
 <pre><code><b>const</b> <a href="math64.md#0x1_math64_EINVALID_ARG_FLOOR_LOG2">EINVALID_ARG_FLOOR_LOG2</a>: u64 = 1;
@@ -55,7 +49,7 @@ Abort value when an invalid argument is provided.
 
 
 
-<a name="0x1_math64_max"></a>
+<a id="0x1_math64_max"></a>
 
 ## Function `max`
 
@@ -80,7 +74,7 @@ Return the largest of two numbers.
 
 </details>
 
-<a name="0x1_math64_min"></a>
+<a id="0x1_math64_min"></a>
 
 ## Function `min`
 
@@ -105,7 +99,7 @@ Return the smallest of two numbers.
 
 </details>
 
-<a name="0x1_math64_average"></a>
+<a id="0x1_math64_average"></a>
 
 ## Function `average`
 
@@ -134,7 +128,38 @@ Return the average of two.
 
 </details>
 
-<a name="0x1_math64_mul_div"></a>
+<a id="0x1_math64_gcd"></a>
+
+## Function `gcd`
+
+Return greatest common divisor of <code>a</code> & <code>b</code>, via the Euclidean algorithm.
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="math64.md#0x1_math64_gcd">gcd</a>(a: u64, b: u64): u64
+</code></pre>
+
+
+
+<details>
+<summary>Implementation</summary>
+
+
+<pre><code><b>public</b> inline <b>fun</b> <a href="math64.md#0x1_math64_gcd">gcd</a>(a: u64, b: u64): u64 {
+    <b>let</b> (large, small) = <b>if</b> (a &gt; b) (a, b) <b>else</b> (b, a);
+    <b>while</b> (small != 0) {
+        <b>let</b> tmp = small;
+        small = large % small;
+        large = tmp;
+    };
+    large
+}
+</code></pre>
+
+
+
+</details>
+
+<a id="0x1_math64_mul_div"></a>
 
 ## Function `mul_div`
 
@@ -151,6 +176,8 @@ Returns a * b / c going through u128 to prevent intermediate overflow
 
 
 <pre><code><b>public</b> inline <b>fun</b> <a href="math64.md#0x1_math64_mul_div">mul_div</a>(a: u64, b: u64, c: u64): u64 {
+    // Inline functions cannot take constants, <b>as</b> then every <b>module</b> using it needs the constant
+    <b>assert</b>!(c != 0, std::error::invalid_argument(4));
     (((a <b>as</b> u128) * (b <b>as</b> u128) / (c <b>as</b> u128)) <b>as</b> u64)
 }
 </code></pre>
@@ -159,7 +186,7 @@ Returns a * b / c going through u128 to prevent intermediate overflow
 
 </details>
 
-<a name="0x1_math64_clamp"></a>
+<a id="0x1_math64_clamp"></a>
 
 ## Function `clamp`
 
@@ -184,7 +211,7 @@ Return x clamped to the interval [lower, upper].
 
 </details>
 
-<a name="0x1_math64_pow"></a>
+<a id="0x1_math64_pow"></a>
 
 ## Function `pow`
 
@@ -221,7 +248,7 @@ Return the value of n raised to power e
 
 </details>
 
-<a name="0x1_math64_floor_log2"></a>
+<a id="0x1_math64_floor_log2"></a>
 
 ## Function `floor_log2`
 
@@ -257,7 +284,7 @@ Returns floor(lg2(x))
 
 </details>
 
-<a name="0x1_math64_log2"></a>
+<a id="0x1_math64_log2"></a>
 
 ## Function `log2`
 
@@ -299,7 +326,7 @@ Returns floor(lg2(x))
 
 </details>
 
-<a name="0x1_math64_sqrt"></a>
+<a id="0x1_math64_sqrt"></a>
 
 ## Function `sqrt`
 
@@ -338,7 +365,7 @@ Returns square root of x, precisely floor(sqrt(x))
 
 </details>
 
-<a name="0x1_math64_ceil_div"></a>
+<a id="0x1_math64_ceil_div"></a>
 
 ## Function `ceil_div`
 
@@ -357,7 +384,8 @@ Returns square root of x, precisely floor(sqrt(x))
     // <a href="math64.md#0x1_math64_ceil_div">ceil_div</a>(x, y) = floor((x + y - 1) / y) = floor((x - 1) / y) + 1
     // (x + y - 1) could spuriously overflow. so we <b>use</b> the later version
     <b>if</b> (x == 0) {
-        <b>assert</b>!(y != 0, <a href="math64.md#0x1_math64_EDIVISION_BY_ZERO">EDIVISION_BY_ZERO</a>);
+        // Inline functions cannot take constants, <b>as</b> then every <b>module</b> using it needs the constant
+        <b>assert</b>!(y != 0, std::error::invalid_argument(4));
         0
     }
     <b>else</b> (x - 1) / y + 1
@@ -368,44 +396,12 @@ Returns square root of x, precisely floor(sqrt(x))
 
 </details>
 
-<a name="0x1_math64_assert_approx_the_same"></a>
-
-## Function `assert_approx_the_same`
-
-For functions that approximate a value it's useful to test a value is close
-to the most correct value up to last digit
-
-
-<pre><code><b>fun</b> <a href="math64.md#0x1_math64_assert_approx_the_same">assert_approx_the_same</a>(x: u128, y: u128, precission: u64)
-</code></pre>
-
-
-
-<details>
-<summary>Implementation</summary>
-
-
-<pre><code><b>fun</b> <a href="math64.md#0x1_math64_assert_approx_the_same">assert_approx_the_same</a>(x: u128, y: u128, precission: u64) {
-    <b>if</b> (x &lt; y) {
-        <b>let</b> tmp = x;
-        x = y;
-        y = tmp;
-    };
-    <b>let</b> mult = (<a href="math64.md#0x1_math64_pow">pow</a>(10, precission) <b>as</b> u128);
-    <b>assert</b>!((x - y) * mult &lt; x, 0);
-}
-</code></pre>
-
-
-
-</details>
-
-<a name="@Specification_1"></a>
+<a id="@Specification_1"></a>
 
 ## Specification
 
 
-<a name="@Specification_1_max"></a>
+<a id="@Specification_1_max"></a>
 
 ### Function `max`
 
@@ -423,7 +419,7 @@ to the most correct value up to last digit
 
 
 
-<a name="@Specification_1_min"></a>
+<a id="@Specification_1_min"></a>
 
 ### Function `min`
 
@@ -441,7 +437,7 @@ to the most correct value up to last digit
 
 
 
-<a name="@Specification_1_average"></a>
+<a id="@Specification_1_average"></a>
 
 ### Function `average`
 
@@ -459,7 +455,27 @@ to the most correct value up to last digit
 
 
 
-<a name="@Specification_1_pow"></a>
+<a id="@Specification_1_clamp"></a>
+
+### Function `clamp`
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="math64.md#0x1_math64_clamp">clamp</a>(x: u64, lower: u64, upper: u64): u64
+</code></pre>
+
+
+
+
+<pre><code><b>requires</b> (lower &lt;= upper);
+<b>aborts_if</b> <b>false</b>;
+<b>ensures</b> (lower &lt;=x && x &lt;= upper) ==&gt; result == x;
+<b>ensures</b> (x &lt; lower) ==&gt; result == lower;
+<b>ensures</b> (upper &lt; x) ==&gt; result == upper;
+</code></pre>
+
+
+
+<a id="@Specification_1_pow"></a>
 
 ### Function `pow`
 
@@ -477,8 +493,46 @@ to the most correct value up to last digit
 
 
 
+<a id="@Specification_1_floor_log2"></a>
 
-<a name="0x1_math64_spec_pow"></a>
+### Function `floor_log2`
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="math64.md#0x1_math64_floor_log2">floor_log2</a>(x: u64): u8
+</code></pre>
+
+
+
+
+<pre><code><b>pragma</b> opaque;
+<b>aborts_if</b> [abstract] x == 0;
+<b>ensures</b> [abstract] <a href="math64.md#0x1_math64_spec_pow">spec_pow</a>(2, result) &lt;= x;
+<b>ensures</b> [abstract] x &lt; <a href="math64.md#0x1_math64_spec_pow">spec_pow</a>(2, result+1);
+</code></pre>
+
+
+
+<a id="@Specification_1_sqrt"></a>
+
+### Function `sqrt`
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="math64.md#0x1_math64_sqrt">sqrt</a>(x: u64): u64
+</code></pre>
+
+
+
+
+<pre><code><b>pragma</b> opaque;
+<b>aborts_if</b> [abstract] <b>false</b>;
+<b>ensures</b> [abstract] x &gt; 0 ==&gt; result * result &lt;= x;
+<b>ensures</b> [abstract] x &gt; 0 ==&gt; x &lt; (result+1) * (result+1);
+</code></pre>
+
+
+
+
+<a id="0x1_math64_spec_pow"></a>
 
 
 <pre><code><b>fun</b> <a href="math64.md#0x1_math64_spec_pow">spec_pow</a>(n: u64, e: u64): u64 {
@@ -492,4 +546,4 @@ to the most correct value up to last digit
 </code></pre>
 
 
-[move-book]: https://aptos.dev/guides/move-guides/book/SUMMARY
+[move-book]: https://aptos.dev/move/book/SUMMARY

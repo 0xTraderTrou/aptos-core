@@ -9,26 +9,28 @@ use aptos_crypto::{
     hash::HashValue,
     ValidCryptoMaterialStringExt,
 };
-use aptos_gas::{InitialGasSchedule, TransactionGasParameters};
+use aptos_gas_schedule::{InitialGasSchedule, TransactionGasParameters};
 use aptos_language_e2e_tests::data_store::{FakeDataStore, GENESIS_CHANGE_SET_HEAD};
-use aptos_state_view::TStateView;
 use aptos_types::{
     access_path::AccessPath,
     account_config::{aptos_test_root_address, AccountResource, CoinStoreResource},
+    block_executor::config::BlockExecutorConfigFromOnchain,
     block_metadata::BlockMetadata,
     chain_id::ChainId,
     contract_event::ContractEvent,
-    state_store::{state_key::StateKey, table::TableHandle},
+    on_chain_config::BlockGasLimitType,
+    state_store::{state_key::StateKey, table::TableHandle, TStateView},
     transaction::{
-        EntryFunction as TransactionEntryFunction, ExecutionStatus, Module as TransactionModule,
-        RawTransaction, Script as TransactionScript, Transaction, TransactionOutput,
-        TransactionStatus,
+        signature_verified_transaction::into_signature_verified_block,
+        EntryFunction as TransactionEntryFunction, ExecutionStatus, RawTransaction,
+        Script as TransactionScript, Transaction, TransactionOutput, TransactionStatus,
     },
 };
 use aptos_vm::{data_cache::AsMoveResolver, AptosVM, VMExecutor};
 use aptos_vm_genesis::GENESIS_KEYPAIR;
-use clap::StructOpt;
+use clap::Parser;
 use move_binary_format::file_format::{CompiledModule, CompiledScript};
+use move_bytecode_verifier::verify_module;
 use move_command_line_common::{
     address::ParsedAddress, files::verify_and_create_named_address_mapping,
 };
@@ -46,12 +48,12 @@ use move_resource_viewer::{AnnotatedMoveValue, MoveValueAnnotator};
 use move_transactional_test_runner::{
     framework::{run_test_impl, CompiledState, MoveTestAdapter},
     tasks::{InitCommand, SyntaxChoice, TaskInput},
-    vm_test_harness::view_resource_in_move_storage,
+    vm_test_harness::{view_resource_in_move_storage, TestRunConfig},
 };
 use move_vm_runtime::session::SerializedReturnValues;
 use once_cell::sync::Lazy;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     convert::TryFrom,
     fmt,
     path::Path,
@@ -74,6 +76,9 @@ struct AptosTestAdapter<'a> {
     storage: FakeDataStore,
     default_syntax: SyntaxChoice,
     private_key_mapping: BTreeMap<String, Ed25519PrivateKey>,
+    #[allow(unused)]
+    comparison_mode: bool,
+    run_config: TestRunConfig,
 }
 
 /// Parameters *required* to create a transaction.
@@ -85,104 +90,108 @@ struct TransactionParameters {
 }
 
 /// Aptos-specific arguments for the publish command.
-#[derive(StructOpt, Debug)]
+#[derive(Parser, Debug)]
 struct AptosPublishArgs {
-    #[structopt(long = "private-key", parse(try_from_str = RawPrivateKey::parse))]
+    #[clap(long = "private-key", value_parser = RawPrivateKey::parse)]
     private_key: Option<RawPrivateKey>,
 
-    #[structopt(long = "expiration")]
+    #[clap(long = "expiration")]
     expiration_time: Option<u64>,
 
-    #[structopt(long = "sequence-number")]
+    #[clap(long = "sequence-number")]
     sequence_number: Option<u64>,
 
-    #[structopt(long = "gas-price")]
+    #[clap(long = "gas-price")]
     gas_unit_price: Option<u64>,
 
-    #[structopt(long = "override-signer", parse(try_from_str = ParsedAddress::parse))]
+    #[clap(long = "override-signer", value_parser= ParsedAddress::parse)]
     override_signer: Option<ParsedAddress>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SignerAndKeyPair {
     address: ParsedAddress,
     private_key: Option<RawPrivateKey>,
 }
 
 /// Aptos-specifc arguments for the run command.
-#[derive(StructOpt, Debug)]
+#[derive(Parser, Debug)]
 struct AptosRunArgs {
-    #[structopt(long = "private-key", parse(try_from_str = RawPrivateKey::parse))]
+    #[clap(long = "private-key", value_parser = RawPrivateKey::parse)]
     private_key: Option<RawPrivateKey>,
 
-    #[structopt(long = "script")]
+    #[clap(long = "script")]
     script: bool,
 
-    #[structopt(long = "expiration")]
+    #[clap(long = "expiration")]
     expiration_time: Option<u64>,
 
-    #[structopt(long = "sequence-number")]
+    #[clap(long = "sequence-number")]
     sequence_number: Option<u64>,
 
-    #[structopt(long = "gas-price")]
+    #[clap(long = "gas-price")]
     gas_unit_price: Option<u64>,
 
-    #[structopt(long = "show-events")]
+    #[clap(long = "show-events")]
     show_events: bool,
 
-    #[structopt(long = "secondary-signers", parse(try_from_str = SignerAndKeyPair::parse), multiple_values(true))]
+    #[clap(long = "secondary-signers", value_parser = SignerAndKeyPair::parse, num_args = 0..)]
     secondary_signers: Option<Vec<SignerAndKeyPair>>,
 }
 
 /// Aptos-specifc arguments for the init command.
-#[derive(StructOpt, Debug)]
+#[derive(Parser, Debug)]
 struct AptosInitArgs {
-    #[structopt(long = "private-keys", parse(try_from_str = parse_named_private_key), multiple_values(true))]
+    #[clap(long = "private-keys", value_parser = parse_named_private_key, num_args = 0..)]
     private_keys: Option<Vec<(Identifier, Ed25519PrivateKey)>>,
-    #[structopt(long = "initial-coins")]
+    #[clap(long = "initial-coins")]
     initial_coins: Option<u64>,
 }
 
 /// A raw private key -- either a literal or an unresolved name.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum RawPrivateKey {
     Named(Identifier),
     Anonymous(Ed25519PrivateKey),
 }
 
 /// Command to initiate a block metadata transaction.
-#[derive(StructOpt, Debug)]
+#[derive(Parser, Debug)]
 struct BlockCommand {
-    #[structopt(long = "proposer", parse(try_from_str = ParsedAddress::parse))]
+    #[clap(long = "proposer", value_parser = ParsedAddress::parse)]
     proposer: ParsedAddress,
 
-    #[structopt(long = "time")]
+    #[clap(long = "time")]
     time: u64,
 }
 
 /// Command to view a table item.
-#[derive(StructOpt, Debug)]
+#[derive(Parser, Debug)]
 struct ViewTableCommand {
-    #[structopt(long = "table_handle")]
+    #[clap(long = "table_handle")]
     table_handle: AccountAddress,
 
-    #[structopt(long = "key_type", parse(try_from_str = parse_type_tag))]
+    #[clap(long = "key_type", value_parser = parse_type_tag)]
     key_type: TypeTag,
 
-    #[structopt(long = "value_type", parse(try_from_str = parse_type_tag))]
+    #[clap(long = "value_type", value_parser = parse_type_tag)]
     value_type: TypeTag,
 
-    #[structopt(long = "key_value", parse(try_from_str = serde_json::from_str))]
+    #[clap(long = "key_value", value_parser = parse_value)]
     key_value: serde_json::Value,
 }
 
+fn parse_value(input: &str) -> Result<serde_json::Value, serde_json::Error> {
+    serde_json::from_str(input)
+}
+
 /// Custom commands for the transactional test flow.
-#[derive(StructOpt, Debug)]
+#[derive(Parser, Debug)]
 enum AptosSubCommand {
-    #[structopt(name = "block")]
+    #[clap(name = "block")]
     BlockCommand(BlockCommand),
 
-    #[structopt(name = "view_table")]
+    #[clap(name = "view_table")]
     ViewTableCommand(ViewTableCommand),
 }
 
@@ -290,6 +299,7 @@ static PRECOMPILED_APTOS_FRAMEWORK: Lazy<FullyCompiledProgram> = Lazy::new(|| {
         deps,
         None,
         move_compiler::Flags::empty().set_sources_shadow_deps(false),
+        aptos_framework::extended_checks::get_all_attribute_names(),
     )
     .unwrap();
     match program_res {
@@ -439,20 +449,17 @@ impl<'a> AptosTestAdapter<'a> {
         let max_number_of_gas_units =
             TransactionGasParameters::initial().maximum_number_of_gas_units;
         let gas_unit_price = gas_unit_price.unwrap_or(1000);
-        let max_gas_amount = match max_gas_amount {
-            Some(max_gas_amount) => max_gas_amount,
-            None => {
-                if gas_unit_price == 0 {
-                    u64::from(max_number_of_gas_units)
-                } else {
-                    let account_balance = self.fetch_account_balance(signer_addr).unwrap();
-                    std::cmp::min(
-                        u64::from(max_number_of_gas_units),
-                        account_balance / gas_unit_price,
-                    )
-                }
-            },
-        };
+        let max_gas_amount = max_gas_amount.unwrap_or_else(|| {
+            if gas_unit_price == 0 {
+                u64::from(max_number_of_gas_units)
+            } else {
+                let account_balance = self.fetch_account_balance(signer_addr).unwrap();
+                std::cmp::min(
+                    u64::from(max_number_of_gas_units),
+                    account_balance / gas_unit_price,
+                )
+            }
+        });
         let expiration_timestamp_secs = expiration_time.unwrap_or(40000);
 
         Ok(TransactionParameters {
@@ -468,7 +475,15 @@ impl<'a> AptosTestAdapter<'a> {
     /// Should error if the transaction ends up being discarded, or having a status other than
     /// EXECUTED.
     fn run_transaction(&mut self, txn: Transaction) -> Result<TransactionOutput> {
-        let mut outputs = AptosVM::execute_block(vec![txn], &self.storage.clone(), None)?;
+        let txn_block = vec![txn];
+        let sig_verified_block = into_signature_verified_block(txn_block);
+        let onchain_config = BlockExecutorConfigFromOnchain {
+            // TODO fetch values from state?
+            block_gas_limit_type: BlockGasLimitType::Limit(30000),
+        };
+        let mut outputs =
+            AptosVM::execute_block(&sig_verified_block, &self.storage.clone(), onchain_config)?
+                .into_inner();
 
         assert_eq!(outputs.len(), 1);
 
@@ -547,8 +562,18 @@ impl<'a> MoveTestAdapter<'a> for AptosTestAdapter<'a> {
         self.default_syntax
     }
 
+    fn known_attributes(&self) -> &BTreeSet<String> {
+        aptos_framework::extended_checks::get_all_attribute_names()
+    }
+
+    fn run_config(&self) -> TestRunConfig {
+        self.run_config.clone()
+    }
+
     fn init(
         default_syntax: SyntaxChoice,
+        comparison_mode: bool,
+        run_config: TestRunConfig,
         pre_compiled_deps: Option<&'a FullyCompiledProgram>,
         task_opt: Option<TaskInput<(InitCommand, Self::ExtraInitArgs)>>,
     ) -> (Self, Option<String>) {
@@ -579,8 +604,8 @@ impl<'a> MoveTestAdapter<'a> for AptosTestAdapter<'a> {
             private_key_mapping.insert(name, private_key);
         }
 
-        // Initial coins to mint, defaults to 5000
-        let mut coins_to_mint = 5000;
+        // Initial coins to mint, defaults to 5,000,000
+        let mut coins_to_mint = 5000000;
 
         if let Some(TaskInput {
             command: (_, init_args),
@@ -610,6 +635,8 @@ impl<'a> MoveTestAdapter<'a> for AptosTestAdapter<'a> {
             default_syntax,
             storage,
             private_key_mapping,
+            comparison_mode,
+            run_config,
         };
 
         for (_, addr) in additional_named_address_mapping {
@@ -623,35 +650,27 @@ impl<'a> MoveTestAdapter<'a> for AptosTestAdapter<'a> {
         &mut self,
         module: CompiledModule,
         mut named_addr_opt: Option<Identifier>,
-        gas_budget: Option<u64>,
+        _gas_budget: Option<u64>,
         extra_args: Self::ExtraPublishArgs,
     ) -> Result<(Option<String>, CompiledModule)> {
-        let module_id = module.self_id();
-
         // TODO: hack to allow the signer to be overridden.
         // See if we can implement it in a cleaner way.
-        let signer = match extra_args.override_signer {
+        let address = match extra_args.override_signer {
             Some(addr) => {
                 if let ParsedAddress::Named(named_addr) = &addr {
                     named_addr_opt = Some(Identifier::new(named_addr.clone()).unwrap())
                 }
                 self.compiled_state().resolve_address(&addr)
             },
-            None => *module_id.address(),
+            None => *module.self_id().address(),
         };
-
-        let params = self.fetch_transaction_parameters(
-            &signer,
-            extra_args.sequence_number,
-            extra_args.expiration_time,
-            extra_args.gas_unit_price,
-            gas_budget,
-        )?;
+        let module_id = ModuleId::new(address, module.self_id().name().to_owned());
 
         let mut module_blob = vec![];
         module.serialize(&mut module_blob).unwrap();
 
-        let private_key = match (extra_args.private_key, named_addr_opt) {
+        // TODO: Do we still need this?
+        let _private_key = match (extra_args.private_key, named_addr_opt) {
             (Some(private_key), _) => self.resolve_private_key(&private_key),
             (None, Some(named_addr)) => match self
                 .private_key_mapping
@@ -663,20 +682,11 @@ impl<'a> MoveTestAdapter<'a> for AptosTestAdapter<'a> {
             (None, None) => panic_missing_private_key("publish"),
         };
 
-        let txn = RawTransaction::new_module(
-            signer,
-            params.sequence_number,
-            TransactionModule::new(module_blob),
-            params.max_gas_amount,
-            params.gas_unit_price,
-            params.expiration_timestamp_secs,
-            ChainId::test(),
-        )
-        .sign(&private_key, Ed25519PublicKey::from(&private_key))?
-        .into_inner();
-
-        self.run_transaction(Transaction::UserTransaction(txn))?;
-
+        // TODO: HACK! This allows us to publish a module without any checks and bypassing publishing
+        //  through native context. Implement in a cleaner way, and simply run the bytecode verifier
+        //  for now.
+        verify_module(&module)?;
+        self.storage.add_module(&module_id, module_blob);
         Ok((None, module))
     }
 
@@ -688,7 +698,7 @@ impl<'a> MoveTestAdapter<'a> for AptosTestAdapter<'a> {
         txn_args: Vec<MoveValue>,
         gas_budget: Option<u64>,
         extra_args: Self::ExtraRunArgs,
-    ) -> Result<(Option<String>, SerializedReturnValues)> {
+    ) -> Result<Option<String>> {
         let signer0 = self.compiled_state().resolve_address(&signers[0]);
 
         if gas_budget.is_some() {
@@ -753,14 +763,7 @@ impl<'a> MoveTestAdapter<'a> for AptosTestAdapter<'a> {
         } else {
             None
         };
-
-        //TODO: replace this dummy value with actual txn return value
-        let a = SerializedReturnValues {
-            mutable_reference_outputs: vec![(0, vec![0], MoveTypeLayout::U8)],
-            return_values: vec![(vec![0], MoveTypeLayout::U8)],
-        };
-
-        Ok((output, a))
+        Ok(output)
     }
 
     fn call_function(
@@ -889,7 +892,7 @@ impl<'a> MoveTestAdapter<'a> for AptosTestAdapter<'a> {
             },
             AptosSubCommand::ViewTableCommand(view_table_cmd) => {
                 let resolver = self.storage.as_move_resolver();
-                let converter = resolver.as_converter(Arc::new(FakeDbReader {}));
+                let converter = resolver.as_converter(Arc::new(FakeDbReader {}), None);
 
                 let vm_key = converter
                     .try_into_vm_value(&view_table_cmd.key_type, view_table_cmd.key_value)
@@ -923,8 +926,13 @@ struct PrettyEvent<'a>(&'a ContractEvent);
 impl<'a> fmt::Display for PrettyEvent<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "{{")?;
-        writeln!(f, "    key:     {}", self.0.key())?;
-        writeln!(f, "    seq_num: {}", self.0.sequence_number())?;
+        match self.0 {
+            ContractEvent::V1(v1) => {
+                writeln!(f, "    key:     {}", v1.key())?;
+                writeln!(f, "    seq_num: {}", v1.sequence_number())?;
+            },
+            ContractEvent::V2(_v2) => (),
+        }
         writeln!(f, "    type:    {}", self.0.type_tag())?;
         writeln!(f, "    data:    {:?}", hex::encode(self.0.event_data()))?;
         write!(f, "}}")
@@ -953,7 +961,12 @@ fn render_events(events: &[ContractEvent]) -> Option<String> {
 }
 
 pub fn run_aptos_test(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    // TODO: remove once bundles removed
-    aptos_vm::aptos_vm::allow_module_bundle_for_test();
-    run_test_impl::<AptosTestAdapter>(path, Some(&*PRECOMPILED_APTOS_FRAMEWORK))
+    run_aptos_test_with_config(path, TestRunConfig::CompilerV1)
+}
+
+pub fn run_aptos_test_with_config(
+    path: &Path,
+    config: TestRunConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_test_impl::<AptosTestAdapter>(config, path, Some(&*PRECOMPILED_APTOS_FRAMEWORK), &None)
 }

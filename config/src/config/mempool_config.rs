@@ -22,6 +22,8 @@ pub struct MempoolConfig {
     pub capacity_per_user: usize,
     /// Number of failover peers to broadcast to when the primary network is alive
     pub default_failovers: usize,
+    /// Whether or not to enable intelligent peer prioritization
+    pub enable_intelligent_peer_prioritization: bool,
     /// The maximum number of broadcasts sent to a single peer that are pending a response ACK at any point.
     pub max_broadcasts_per_peer: usize,
     /// Maximum number of inbound network messages to the Mempool application
@@ -40,6 +42,10 @@ pub struct MempoolConfig {
     pub shared_mempool_max_concurrent_inbound_syncs: usize,
     /// Interval to broadcast to upstream nodes.
     pub shared_mempool_tick_interval_ms: u64,
+    /// Interval to update peers in shared mempool.
+    pub shared_mempool_peer_update_interval_ms: u64,
+    /// Interval to update peer priorities in shared mempool (seconds).
+    pub shared_mempool_priority_update_interval_secs: u64,
     /// Number of seconds until the transaction will be removed from the Mempool ignoring if the transaction has expired.
     ///
     /// This ensures that the Mempool isn't just full of non-expiring transactions that are way off into the future.
@@ -57,19 +63,22 @@ pub struct MempoolConfig {
 impl Default for MempoolConfig {
     fn default() -> MempoolConfig {
         MempoolConfig {
-            shared_mempool_tick_interval_ms: 50,
+            shared_mempool_tick_interval_ms: 10,
             shared_mempool_backoff_interval_ms: 30_000,
-            shared_mempool_batch_size: 100,
+            shared_mempool_batch_size: 300,
             shared_mempool_max_batch_bytes: MAX_APPLICATION_MESSAGE_SIZE as u64,
             shared_mempool_ack_timeout_ms: 2_000,
             shared_mempool_max_concurrent_inbound_syncs: 4,
-            max_broadcasts_per_peer: 1,
+            max_broadcasts_per_peer: 20,
             max_network_channel_size: 1024,
             mempool_snapshot_interval_secs: 180,
             capacity: 2_000_000,
             capacity_bytes: 2 * 1024 * 1024 * 1024,
             capacity_per_user: 100,
             default_failovers: 1,
+            enable_intelligent_peer_prioritization: true,
+            shared_mempool_peer_update_interval_ms: 1_000,
+            shared_mempool_priority_update_interval_secs: 600, // 10 minutes (frequent reprioritization is expensive)
             system_transaction_timeout_secs: 600,
             system_transaction_gc_interval_ms: 60_000,
             broadcast_buckets: DEFAULT_BUCKETS.to_vec(),
@@ -81,9 +90,9 @@ impl Default for MempoolConfig {
 
 impl ConfigSanitizer for MempoolConfig {
     fn sanitize(
-        _node_config: &mut NodeConfig,
+        _node_config: &NodeConfig,
         _node_type: NodeType,
-        _chain_id: ChainId,
+        _chain_id: Option<ChainId>,
     ) -> Result<(), Error> {
         Ok(()) // TODO: add reasonable verifications
     }
@@ -94,13 +103,25 @@ impl ConfigOptimizer for MempoolConfig {
         node_config: &mut NodeConfig,
         local_config_yaml: &Value,
         node_type: NodeType,
-        _chain_id: ChainId,
+        _chain_id: Option<ChainId>,
     ) -> Result<bool, Error> {
         let mempool_config = &mut node_config.mempool;
         let local_mempool_config_yaml = &local_config_yaml["mempool"];
 
         // Change the default configs for VFNs
         let mut modified_config = false;
+        if node_type.is_validator() {
+            // Set the max_broadcasts_per_peer to 2 (default is 20)
+            if local_mempool_config_yaml["max_broadcasts_per_peer"].is_null() {
+                mempool_config.max_broadcasts_per_peer = 2;
+                modified_config = true;
+            }
+            // Set the batch size per broadcast to 200 (default is 300)
+            if local_mempool_config_yaml["shared_mempool_batch_size"].is_null() {
+                mempool_config.shared_mempool_batch_size = 200;
+                modified_config = true;
+            }
+        }
         if node_type.is_validator_fullnode() {
             // Set the shared_mempool_max_concurrent_inbound_syncs to 16 (default is 4)
             if local_mempool_config_yaml["shared_mempool_max_concurrent_inbound_syncs"].is_null() {
@@ -108,27 +129,9 @@ impl ConfigOptimizer for MempoolConfig {
                 modified_config = true;
             }
 
-            // Set the max_broadcasts_per_peer to 4 (default is 1)
-            if local_mempool_config_yaml["max_broadcasts_per_peer"].is_null() {
-                mempool_config.max_broadcasts_per_peer = 4;
-                modified_config = true;
-            }
-
             // Set the default_failovers to 0 (default is 1)
             if local_mempool_config_yaml["default_failovers"].is_null() {
                 mempool_config.default_failovers = 0;
-                modified_config = true;
-            }
-
-            // Set the shared_mempool_batch_size to 200 (default is 100)
-            if local_mempool_config_yaml["shared_mempool_batch_size"].is_null() {
-                mempool_config.shared_mempool_batch_size = 200;
-                modified_config = true;
-            }
-
-            // Set the shared_mempool_tick_interval_ms to 10 (default is 50)
-            if local_mempool_config_yaml["shared_mempool_tick_interval_ms"].is_null() {
-                mempool_config.shared_mempool_tick_interval_ms = 10;
                 modified_config = true;
             }
         }
@@ -151,7 +154,7 @@ mod tests {
             &mut node_config,
             &serde_yaml::from_str("{}").unwrap(), // An empty local config,
             NodeType::ValidatorFullnode,
-            ChainId::testnet(),
+            Some(ChainId::testnet()),
         )
         .unwrap();
         assert!(modified_config);
@@ -162,9 +165,9 @@ mod tests {
             mempool_config.shared_mempool_max_concurrent_inbound_syncs,
             16
         );
-        assert_eq!(mempool_config.max_broadcasts_per_peer, 4);
+        assert_eq!(mempool_config.max_broadcasts_per_peer, 20);
         assert_eq!(mempool_config.default_failovers, 0);
-        assert_eq!(mempool_config.shared_mempool_batch_size, 200);
+        assert_eq!(mempool_config.shared_mempool_batch_size, 300);
         assert_eq!(mempool_config.shared_mempool_tick_interval_ms, 10);
     }
 
@@ -178,10 +181,10 @@ mod tests {
             &mut node_config,
             &serde_yaml::from_str("{}").unwrap(), // An empty local config,
             NodeType::Validator,
-            ChainId::mainnet(),
+            Some(ChainId::mainnet()),
         )
         .unwrap();
-        assert!(!modified_config);
+        assert!(modified_config);
 
         // Verify that all relevant fields are not modified
         let mempool_config = &node_config.mempool;
@@ -190,18 +193,12 @@ mod tests {
             mempool_config.shared_mempool_max_concurrent_inbound_syncs,
             default_mempool_config.shared_mempool_max_concurrent_inbound_syncs
         );
-        assert_eq!(
-            mempool_config.max_broadcasts_per_peer,
-            default_mempool_config.max_broadcasts_per_peer
-        );
+        assert_eq!(mempool_config.max_broadcasts_per_peer, 2);
         assert_eq!(
             mempool_config.default_failovers,
             default_mempool_config.default_failovers
         );
-        assert_eq!(
-            mempool_config.shared_mempool_batch_size,
-            default_mempool_config.shared_mempool_batch_size
-        );
+        assert_eq!(mempool_config.shared_mempool_batch_size, 200);
         assert_eq!(
             mempool_config.shared_mempool_tick_interval_ms,
             default_mempool_config.shared_mempool_tick_interval_ms
@@ -211,16 +208,24 @@ mod tests {
     #[test]
     fn test_optimize_vfn_config_no_overrides() {
         // Create the default validator config
+        let local_shared_mempool_max_concurrent_inbound_syncs = 1;
+        let local_max_broadcasts_per_peer = 1;
         let mut node_config = NodeConfig::get_default_vfn_config();
+        node_config
+            .mempool
+            .shared_mempool_max_concurrent_inbound_syncs =
+            local_shared_mempool_max_concurrent_inbound_syncs;
+        node_config.mempool.max_broadcasts_per_peer = local_max_broadcasts_per_peer;
 
         // Create a local config YAML with some local overrides
-        let local_config_yaml = serde_yaml::from_str(
+        let local_config_yaml = serde_yaml::from_str(&format!(
             r#"
             mempool:
-              shared_mempool_max_concurrent_inbound_syncs: 4
-              max_broadcasts_per_peer: 1
+                shared_mempool_max_concurrent_inbound_syncs: {}
+                max_broadcasts_per_peer: {}
             "#,
-        )
+            local_shared_mempool_max_concurrent_inbound_syncs, local_max_broadcasts_per_peer
+        ))
         .unwrap();
 
         // Optimize the config and verify modifications are made
@@ -228,30 +233,20 @@ mod tests {
             &mut node_config,
             &local_config_yaml,
             NodeType::ValidatorFullnode,
-            ChainId::mainnet(),
+            Some(ChainId::mainnet()),
         )
         .unwrap();
         assert!(modified_config);
 
         // Verify that only the relevant fields are modified
         let mempool_config = &node_config.mempool;
-        let default_mempool_config = MempoolConfig::default();
         assert_eq!(
             mempool_config.shared_mempool_max_concurrent_inbound_syncs,
-            4
+            local_shared_mempool_max_concurrent_inbound_syncs
         );
-        assert_eq!(mempool_config.max_broadcasts_per_peer, 1);
-        assert_ne!(
-            mempool_config.default_failovers,
-            default_mempool_config.default_failovers
-        );
-        assert_ne!(
-            mempool_config.shared_mempool_batch_size,
-            default_mempool_config.shared_mempool_batch_size
-        );
-        assert_ne!(
-            mempool_config.shared_mempool_tick_interval_ms,
-            default_mempool_config.shared_mempool_tick_interval_ms
+        assert_eq!(
+            mempool_config.max_broadcasts_per_peer,
+            local_max_broadcasts_per_peer
         );
     }
 }

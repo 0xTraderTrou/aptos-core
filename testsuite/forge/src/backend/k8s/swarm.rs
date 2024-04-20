@@ -3,18 +3,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
+    chaos_schema::{
+        Chaos, ChaosConditionType, ChaosStatus, ConditionStatus, NetworkChaos, StressChaos,
+    },
     check_for_container_restart, create_k8s_client, delete_all_chaos, get_default_pfn_node_config,
     get_free_port, get_stateful_set_image, install_public_fullnode,
-    interface::system_metrics::{query_prometheus_system_metrics, SystemMetricsThreshold},
     node::K8sNode,
-    prometheus::{self, query_with_metadata},
+    prometheus::{self, query_range_with_metadata, query_with_metadata},
     query_sequence_number, set_stateful_set_image_tag, uninstall_testnet_resources, ChainInfo,
     FullNode, K8sApi, Node, Result, Swarm, SwarmChaos, Validator, Version, HAPROXY_SERVICE_SUFFIX,
     REST_API_HAPROXY_SERVICE_PORT, REST_API_SERVICE_PORT,
 };
 use ::aptos_logger::*;
 use anyhow::{anyhow, bail, format_err};
-use aptos_config::config::NodeConfig;
+use aptos_config::config::{NodeConfig, OverrideNodeConfig};
 use aptos_retrier::fixed_retry_strategy;
 use aptos_sdk::{
     crypto::ed25519::Ed25519PrivateKey,
@@ -29,7 +31,10 @@ use kube::{
     api::{Api, ListParams},
     client::Client as K8sClient,
 };
-use prometheus_http_query::{response::PromqlResult, Client as PrometheusClient};
+use prometheus_http_query::{
+    response::{PromqlResult, Sample},
+    Client as PrometheusClient,
+};
 use regex::Regex;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -52,6 +57,7 @@ pub struct K8sSwarm {
     prom_client: Option<PrometheusClient>,
     era: Option<String>,
     use_port_forward: bool,
+    chaos_experiment_ops: Box<dyn ChaosExperimentOps + Send + Sync>,
 }
 
 impl K8sSwarm {
@@ -99,7 +105,7 @@ impl K8sSwarm {
             validators,
             fullnodes,
             root_account,
-            kube_client,
+            kube_client: kube_client.clone(),
             chain_id: ChainId::new(4),
             versions: Arc::new(versions),
             kube_namespace: kube_namespace.to_string(),
@@ -108,6 +114,10 @@ impl K8sSwarm {
             prom_client,
             era,
             use_port_forward,
+            chaos_experiment_ops: Box::new(RealChaosExperimentOps {
+                kube_client: kube_client.clone(),
+                kube_namespace: kube_namespace.to_string(),
+            }),
         };
 
         // test hitting the configured prometheus endpoint
@@ -148,7 +158,7 @@ impl K8sSwarm {
     async fn install_public_fullnode_resources<'a>(
         &mut self,
         version: &'a Version,
-        node_config: &'a NodeConfig,
+        node_config: &'a OverrideNodeConfig,
     ) -> Result<(PeerId, K8sNode)> {
         // create APIs
         let stateful_set_api: Arc<K8sApi<_>> = Arc::new(K8sApi::<StatefulSet>::from_client(
@@ -181,6 +191,7 @@ impl K8sSwarm {
                 .clone(),
             self.kube_namespace.clone(),
             self.use_port_forward,
+            self.fullnodes.len(),
         )
         .await?;
         k8snode.start().await?; // actually start the node. if port-forward is enabled, this is when it gets its ephemeral port
@@ -261,15 +272,23 @@ impl Swarm for K8sSwarm {
     }
 
     fn full_nodes<'a>(&'a self) -> Box<dyn Iterator<Item = &'a dyn FullNode> + 'a> {
-        Box::new(self.fullnodes.values().map(|v| v as &'a dyn FullNode))
+        let mut full_nodes: Vec<_> = self
+            .fullnodes
+            .values()
+            .map(|n| n as &'a dyn FullNode)
+            .collect();
+        full_nodes.sort_by_key(|n| n.index());
+        Box::new(full_nodes.into_iter())
     }
 
     fn full_nodes_mut<'a>(&'a mut self) -> Box<dyn Iterator<Item = &'a mut dyn FullNode> + 'a> {
-        Box::new(
-            self.fullnodes
-                .values_mut()
-                .map(|v| v as &'a mut dyn FullNode),
-        )
+        let mut full_nodes: Vec<_> = self
+            .fullnodes
+            .values_mut()
+            .map(|n| n as &'a mut dyn FullNode)
+            .collect();
+        full_nodes.sort_by_key(|n| n.index());
+        Box::new(full_nodes.into_iter())
     }
 
     fn full_node(&self, id: PeerId) -> Option<&dyn FullNode> {
@@ -291,14 +310,18 @@ impl Swarm for K8sSwarm {
     fn add_validator_full_node(
         &mut self,
         _version: &Version,
-        _template: NodeConfig,
+        _config: OverrideNodeConfig,
         _id: PeerId,
     ) -> Result<PeerId> {
         todo!()
     }
 
-    async fn add_full_node(&mut self, version: &Version, template: NodeConfig) -> Result<PeerId> {
-        self.install_public_fullnode_resources(version, &template)
+    async fn add_full_node(
+        &mut self,
+        version: &Version,
+        config: OverrideNodeConfig,
+    ) -> Result<PeerId> {
+        self.install_public_fullnode_resources(version, &config)
             .await
             .map(|(peer_id, node)| {
                 self.fullnodes.insert(peer_id, node);
@@ -331,13 +354,21 @@ impl Swarm for K8sSwarm {
         "See fgi output for more information.".to_string()
     }
 
-    fn inject_chaos(&mut self, chaos: SwarmChaos) -> Result<()> {
+    async fn inject_chaos(&mut self, chaos: SwarmChaos) -> Result<()> {
         self.inject_swarm_chaos(&chaos)?;
         self.chaoses.insert(chaos);
+        self.chaos_experiment_ops
+            .ensure_chaos_experiments_active()
+            .await?;
+
         Ok(())
     }
 
-    fn remove_chaos(&mut self, chaos: SwarmChaos) -> Result<()> {
+    async fn remove_chaos(&mut self, chaos: SwarmChaos) -> Result<()> {
+        self.chaos_experiment_ops
+            .ensure_chaos_experiments_active()
+            .await?;
+
         if self.chaoses.remove(&chaos) {
             self.remove_swarm_chaos(&chaos)?;
         } else {
@@ -346,7 +377,11 @@ impl Swarm for K8sSwarm {
         Ok(())
     }
 
-    fn remove_all_chaos(&mut self) -> Result<()> {
+    async fn remove_all_chaos(&mut self) -> Result<()> {
+        self.chaos_experiment_ops
+            .ensure_chaos_experiments_active()
+            .await?;
+
         // try removing all existing chaoses
         for chaos in self.chaoses.clone() {
             self.remove_swarm_chaos(&chaos)?;
@@ -393,32 +428,33 @@ impl Swarm for K8sSwarm {
         if let Some(c) = &self.prom_client {
             let mut labels_map = BTreeMap::new();
             labels_map.insert("namespace".to_string(), self.kube_namespace.clone());
-            return query_with_metadata(c, query, time, timeout, labels_map).await;
+            return query_with_metadata(c, query, time, timeout, &labels_map).await;
         }
         bail!("No prom client");
     }
 
-    async fn ensure_healthy_system_metrics(
-        &mut self,
+    async fn query_range_metrics(
+        &self,
+        query: &str,
         start_time: i64,
         end_time: i64,
-        threshold: SystemMetricsThreshold,
-    ) -> Result<()> {
+        timeout: Option<i64>,
+    ) -> Result<Vec<Sample>> {
         if let Some(c) = &self.prom_client {
-            let system_metrics = query_prometheus_system_metrics(
+            let mut labels_map = BTreeMap::new();
+            labels_map.insert("namespace".to_string(), self.kube_namespace.clone());
+            return query_range_with_metadata(
                 c,
+                query,
                 start_time,
                 end_time,
                 30.0,
-                &self.kube_namespace,
+                timeout,
+                &labels_map,
             )
-            .await?;
-            threshold.ensure_threshold(&system_metrics)?;
-            info!("System metrics are healthy");
-            Ok(())
-        } else {
-            bail!("No prom client");
+            .await;
         }
+        bail!("No prom client");
     }
 
     fn chain_info_for_node(&mut self, idx: usize) -> ChainInfo<'_> {
@@ -496,6 +532,18 @@ fn get_k8s_node_from_stateful_set(
     if !use_port_forward {
         service_name = format!("{}.{}.svc", &service_name, &namespace);
     }
+
+    // Append the cluster name if its a multi-cluster deployment
+    let service_name = if let Some(target_cluster_name) = sts
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get("multicluster/targetcluster"))
+    {
+        format!("{}.{}", &service_name, &target_cluster_name)
+    } else {
+        service_name
+    };
 
     // If HAProxy is enabled, use the port on its Service. Otherwise use the port on the validator Service
     let mut rest_api_port = if enable_haproxy {
@@ -652,9 +700,118 @@ impl Drop for K8sSwarm {
     }
 }
 
+#[async_trait::async_trait]
+trait ChaosExperimentOps {
+    async fn list_network_chaos(&self) -> Result<Vec<NetworkChaos>>;
+    async fn list_stress_chaos(&self) -> Result<Vec<StressChaos>>;
+
+    async fn ensure_chaos_experiments_active(&self) -> Result<()> {
+        let timeout_duration = Duration::from_secs(300); // 5 minutes
+        let polling_interval = Duration::from_secs(5);
+
+        tokio::time::timeout(timeout_duration, async {
+            loop {
+                match self.are_chaos_experiments_active().await {
+                    Ok(true) => {
+                        info!("Chaos experiments are active");
+                        return Ok(());
+                    },
+                    Ok(false) => {
+                        info!("Chaos experiments are not active, retrying...");
+                    },
+                    Err(e) => {
+                        warn!(
+                            "Error while checking chaos experiments status: {}. Retrying...",
+                            e
+                        );
+                    },
+                }
+                tokio::time::sleep(polling_interval).await;
+            }
+        })
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "Timed out waiting for chaos experiments to be active: {}",
+                e
+            )
+        })?
+    }
+
+    /// Checks if all chaos experiments are active
+    async fn are_chaos_experiments_active(&self) -> Result<bool> {
+        let (network_chaoses, stress_chaoses) =
+            tokio::join!(self.list_network_chaos(), self.list_stress_chaos());
+
+        let chaoses: Vec<Chaos> = network_chaoses?
+            .into_iter()
+            .map(Chaos::Network)
+            .chain(stress_chaoses?.into_iter().map(Chaos::Stress))
+            .collect();
+
+        Ok(!chaoses.is_empty()
+            && chaoses.iter().all(|chaos| match chaos {
+                Chaos::Network(network_chaos) => check_all_injected(&network_chaos.status),
+                Chaos::Stress(stress_chaos) => check_all_injected(&stress_chaos.status),
+            }))
+    }
+}
+
+fn check_all_injected(status: &Option<ChaosStatus>) -> bool {
+    status
+        .as_ref()
+        .and_then(|status| status.conditions.as_ref())
+        .map_or(false, |conditions| {
+            conditions.iter().any(|c| {
+                c.r#type == ChaosConditionType::AllInjected && c.status == ConditionStatus::True
+            })
+        })
+}
+
+struct MockChaosExperimentOps {
+    network_chaos: Vec<NetworkChaos>,
+    stress_chaos: Vec<StressChaos>,
+}
+
+#[async_trait::async_trait]
+impl ChaosExperimentOps for MockChaosExperimentOps {
+    async fn list_network_chaos(&self) -> Result<Vec<NetworkChaos>> {
+        Ok(self.network_chaos.clone())
+    }
+
+    async fn list_stress_chaos(&self) -> Result<Vec<StressChaos>> {
+        Ok(self.stress_chaos.clone())
+    }
+}
+
+struct RealChaosExperimentOps {
+    kube_client: K8sClient,
+    kube_namespace: String,
+}
+
+#[async_trait::async_trait]
+impl ChaosExperimentOps for RealChaosExperimentOps {
+    async fn list_network_chaos(&self) -> Result<Vec<NetworkChaos>> {
+        let network_chaos_api: Api<NetworkChaos> =
+            Api::namespaced(self.kube_client.clone(), &self.kube_namespace);
+        let lp = ListParams::default();
+        let network_chaoses = network_chaos_api.list(&lp).await?.items;
+        Ok(network_chaoses)
+    }
+
+    async fn list_stress_chaos(&self) -> Result<Vec<StressChaos>> {
+        let stress_chaos_api: Api<StressChaos> =
+            Api::namespaced(self.kube_client.clone(), &self.kube_namespace);
+        let lp = ListParams::default();
+        let stress_chaoses = stress_chaos_api.list(&lp).await?.items;
+        Ok(stress_chaoses)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chaos_schema::ChaosCondition;
 
     #[test]
     fn test_parse_service_name_from_stateful_set_name() {
@@ -675,5 +832,58 @@ mod tests {
         let fullnode_service_name =
             parse_service_name_from_stateful_set_name(fullnode_sts_name, true);
         assert_eq!("aptos-node-0-fullnode-lb", &fullnode_service_name);
+    }
+
+    async fn create_chaos_experiments(
+        network_status: ConditionStatus,
+        stress_status: ConditionStatus,
+    ) -> (Vec<NetworkChaos>, Vec<StressChaos>) {
+        let network_chaos = NetworkChaos {
+            status: Some(ChaosStatus {
+                conditions: Some(vec![ChaosCondition {
+                    r#type: ChaosConditionType::AllInjected,
+                    status: network_status,
+                }]),
+            }),
+            ..NetworkChaos::new("test", Default::default())
+        };
+        let stress_chaos = StressChaos {
+            status: Some(ChaosStatus {
+                conditions: Some(vec![ChaosCondition {
+                    r#type: ChaosConditionType::AllInjected,
+                    status: stress_status,
+                }]),
+            }),
+            ..StressChaos::new("test", Default::default())
+        };
+        (vec![network_chaos], vec![stress_chaos])
+    }
+
+    #[tokio::test]
+    async fn test_chaos_experiments_active() {
+        // No experiments active
+        let chaos_ops = MockChaosExperimentOps {
+            network_chaos: vec![],
+            stress_chaos: vec![],
+        };
+        assert!(!chaos_ops.are_chaos_experiments_active().await.unwrap());
+
+        // Only network chaos active
+        let (network_chaos, stress_chaos) =
+            create_chaos_experiments(ConditionStatus::True, ConditionStatus::False).await;
+        let chaos_ops = MockChaosExperimentOps {
+            network_chaos,
+            stress_chaos,
+        };
+        assert!(!chaos_ops.are_chaos_experiments_active().await.unwrap());
+
+        // Both network and stress chaos active
+        let (network_chaos, stress_chaos) =
+            create_chaos_experiments(ConditionStatus::True, ConditionStatus::True).await;
+        let chaos_ops = MockChaosExperimentOps {
+            network_chaos,
+            stress_chaos,
+        };
+        assert!(chaos_ops.are_chaos_experiments_active().await.unwrap());
     }
 }

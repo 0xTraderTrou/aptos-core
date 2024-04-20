@@ -1,10 +1,15 @@
 // Copyright © Aptos Foundation
+// SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{Context, Ok, Result};
+use anyhow::{Context, Result};
+#[cfg(target_os = "linux")]
+use aptos_system_utils::profiling::start_cpu_profiling;
 use backtrace::Backtrace;
 use clap::Parser;
 use prometheus::{Encoder, TextEncoder};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+use std::convert::Infallible;
 use std::{fs::File, io::Read, panic::PanicInfo, path::PathBuf, process};
 use tracing::error;
 use tracing_subscriber::EnvFilter;
@@ -14,7 +19,7 @@ use warp::{http::Response, Filter};
 /// the specific service.
 #[derive(Parser)]
 pub struct ServerArgs {
-    #[clap(short, long, parse(from_os_str))]
+    #[clap(short, long, value_parser)]
     pub config_path: PathBuf,
 }
 
@@ -24,9 +29,12 @@ impl ServerArgs {
         C: RunnableConfig,
     {
         // Set up the server.
-        setup_logging();
+        setup_logging(None);
         setup_panic_handler();
         let config = load::<GenericConfig<C>>(&self.config_path)?;
+        config
+            .validate()
+            .context("Config did not pass validation")?;
         run_server_with_config(config).await
     }
 }
@@ -35,21 +43,32 @@ pub async fn run_server_with_config<C>(config: GenericConfig<C>) -> Result<()>
 where
     C: RunnableConfig,
 {
-    let runtime = aptos_runtimes::spawn_named_runtime(config.get_server_name(), None);
     let health_port = config.health_check_port;
     // Start liveness and readiness probes.
-    let task_handler = runtime.spawn(async move {
+    let task_handler = tokio::spawn(async move {
         register_probes_and_metrics_handler(health_port).await;
-        Ok(())
+        anyhow::Ok(())
     });
-    let main_task_handler = runtime.spawn(async move { config.run().await });
-    let results = futures::future::join_all(vec![task_handler, main_task_handler]).await;
-    let errors = results.iter().filter(|r| r.is_err()).collect::<Vec<_>>();
-    if !errors.is_empty() {
-        return Err(anyhow::anyhow!("Failed to run server: {:?}", errors));
+    let main_task_handler =
+        tokio::spawn(async move { config.run().await.expect("task should exit with Ok.") });
+    tokio::select! {
+        res = task_handler => {
+            if let Err(e) = res {
+                error!("Probes and metrics handler panicked or was shutdown: {:?}", e);
+                process::exit(1);
+            } else {
+                panic!("Probes and metrics handler exited unexpectedly");
+            }
+        },
+        res = main_task_handler => {
+            if let Err(e) = res {
+                error!("Main task panicked or was shutdown: {:?}", e);
+                process::exit(1);
+            } else {
+                panic!("Main task exited unexpectedly");
+            }
+        },
     }
-    // TODO(larry): fix the dropped runtime issue.
-    Ok(())
 }
 
 #[derive(Deserialize, Debug, Serialize)]
@@ -66,6 +85,10 @@ impl<T> RunnableConfig for GenericConfig<T>
 where
     T: RunnableConfig,
 {
+    fn validate(&self) -> Result<()> {
+        self.server_config.validate()
+    }
+
     async fn run(&self) -> Result<()> {
         self.server_config.run().await
     }
@@ -78,7 +101,15 @@ where
 /// RunnableConfig is a trait that all services must implement for their configuration.
 #[async_trait::async_trait]
 pub trait RunnableConfig: DeserializeOwned + Send + Sync + 'static {
+    // Validate the config.
+    fn validate(&self) -> Result<()> {
+        Ok(())
+    }
+
+    // Run something based on the config.
     async fn run(&self) -> Result<()>;
+
+    // Get the server name.
     fn get_server_name(&self) -> String;
 }
 
@@ -100,7 +131,7 @@ pub struct CrashInfo {
 
 /// Invoke to ensure process exits on a thread panic.
 ///
-/// Tokio's default behavior is to catch panics and ignore them.  Invoking this function will
+/// Tokio's default behavior is to catch panics and ignore them. Invoking this function will
 /// ensure that all subsequent thread panics (even Tokio threads) will report the
 /// details/backtrace and then exit.
 pub fn setup_panic_handler() {
@@ -124,26 +155,35 @@ fn handle_panic(panic_info: &PanicInfo<'_>) {
     process::exit(12);
 }
 
-/// Set up logging for the server.
-pub fn setup_logging() {
+/// Set up logging for the server. By default we don't set a writer, in which case it
+/// just logs to stdout. This can be overridden using the `make_writer` parameter.
+/// This can be helpful for custom logging, e.g. logging to different files based on
+/// the origin of the logging.
+pub fn setup_logging(make_writer: Option<Box<dyn Fn() -> Box<dyn std::io::Write> + Send + Sync>>) {
     let env_filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new("info"))
         .unwrap();
-    tracing_subscriber::fmt()
+
+    let subscriber = tracing_subscriber::fmt()
         .json()
         .with_file(true)
         .with_line_number(true)
         .with_thread_ids(true)
         .with_target(false)
         .with_thread_names(true)
-        .with_env_filter(env_filter)
-        .init();
+        .with_env_filter(env_filter);
+
+    match make_writer {
+        Some(w) => subscriber.with_writer(w).init(),
+        None => subscriber.init(),
+    }
 }
 
 /// Register readiness and liveness probes and set up metrics endpoint.
 async fn register_probes_and_metrics_handler(port: u16) {
     let readiness = warp::path("readiness")
         .map(move || warp::reply::with_status("ready", warp::http::StatusCode::OK));
+
     let metrics_endpoint = warp::path("metrics").map(|| {
         // Metrics encoding.
         let metrics = aptos_metrics_core::gather();
@@ -159,9 +199,42 @@ async fn register_probes_and_metrics_handler(port: u16) {
             .header("Content-Type", "text/plain")
             .body(encode_buffer)
     });
-    warp::serve(readiness.or(metrics_endpoint))
-        .run(([0, 0, 0, 0], port))
-        .await;
+
+    if cfg!(target_os = "linux") {
+        #[cfg(target_os = "linux")]
+        let profilez = warp::path("profilez").and_then(|| async move {
+            // TODO(grao): Consider make the parameters configurable.
+            Ok::<_, Infallible>(match start_cpu_profiling(10, 99, false).await {
+                Ok(body) => {
+                    let response = Response::builder()
+                        .header("Content-Length", body.len())
+                        .header("Content-Disposition", "inline")
+                        .header("Content-Type", "image/svg+xml")
+                        .body(body);
+
+                    match response {
+                        Ok(res) => warp::reply::with_status(res, warp::http::StatusCode::OK),
+                        Err(e) => warp::reply::with_status(
+                            Response::new(format!("Profiling failed: {e:?}.").as_bytes().to_vec()),
+                            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        ),
+                    }
+                },
+                Err(e) => warp::reply::with_status(
+                    Response::new(format!("Profiling failed: {e:?}.").as_bytes().to_vec()),
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                ),
+            })
+        });
+        #[cfg(target_os = "linux")]
+        warp::serve(readiness.or(metrics_endpoint).or(profilez))
+            .run(([0, 0, 0, 0], port))
+            .await;
+    } else {
+        warp::serve(readiness.or(metrics_endpoint))
+            .run(([0, 0, 0, 0], port))
+            .await;
+    }
 }
 
 #[cfg(test)]
@@ -208,5 +281,11 @@ mod tests {
         assert_eq!(config.health_check_port, 12345);
         assert_eq!(config.server_config.test, 123);
         assert_eq!(config.server_config.test_name, "test");
+    }
+
+    #[test]
+    fn verify_tool() {
+        use clap::CommandFactory;
+        ServerArgs::command().debug_assert()
     }
 }

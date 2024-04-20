@@ -49,7 +49,7 @@ fn end_to_end() {
         .collect::<Vec<_>>();
     let max_chunk_size = txns
         .iter()
-        .map(|t| bcs::to_bytes(t).unwrap().len())
+        .map(|t| bcs::serialized_size(t).unwrap())
         .max()
         .unwrap() // biggest txn
         + 115 // size of a serialized TransactionInfo
@@ -115,7 +115,6 @@ fn end_to_end() {
         .run(),
     )
     .unwrap();
-
     // We don't write down any ledger infos when recovering transactions. State-sync needs to take
     // care of it before running consensus. The latest transactions are deemed "synced" instead of
     // "committed" most likely.
@@ -138,14 +137,7 @@ fn end_to_end() {
         assert_eq!(restore_ws, org_ws);
     }
 
-    assert_eq!(
-        tgt_db
-            .get_latest_transaction_info_option()
-            .unwrap()
-            .unwrap()
-            .0,
-        target_version,
-    );
+    assert_eq!(tgt_db.get_latest_version().unwrap(), target_version);
     let recovered_transactions = tgt_db
         .get_transactions(
             0,

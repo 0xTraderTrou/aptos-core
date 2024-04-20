@@ -72,9 +72,18 @@ fn log_config_and_build_information(node_config: &NodeConfig) {
         info!("{}: {}", key, value);
     }
 
-    // Log the feature information
+    // Log the feature information. Note: this should be kept up-to-date
+    // with the features defined in the aptos-node Cargo.toml file.
     info!("Feature information:");
-    log_feature_info!("failpoints", "assert-private-keys-not-cloneable");
+    log_feature_info!(
+        "assert-private-keys-not-cloneable",
+        "check-vm-features",
+        "consensus-only-perf-test",
+        "default",
+        "failpoints",
+        "indexer",
+        "tokio-console"
+    );
 
     // Log the node config
     let mut config = node_config;

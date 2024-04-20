@@ -83,7 +83,11 @@ impl VMError {
                     "Expected a code and module/script location with ABORTED, but got {:?} and {}",
                     sub_status, location
                 );
-                VMStatus::Error(StatusCode::ABORTED, message)
+                VMStatus::Error {
+                    status_code: StatusCode::ABORTED,
+                    sub_status,
+                    message,
+                }
             },
 
             (major_status, sub_status, location)
@@ -93,7 +97,11 @@ impl VMError {
                     Location::Script => vm_status::AbortLocation::Script,
                     Location::Module(id) => vm_status::AbortLocation::Module(id.clone()),
                     Location::Undefined => {
-                        return VMStatus::Error(major_status, message);
+                        return VMStatus::Error {
+                            status_code: major_status,
+                            sub_status,
+                            message,
+                        };
                     },
                 };
                 // Errors for OUT_OF_GAS do not always have index set: if it does not, it should already return above.
@@ -110,7 +118,11 @@ impl VMError {
                 );
                 let (function, code_offset) = match offsets.pop() {
                     None => {
-                        return VMStatus::Error(major_status, message);
+                        return VMStatus::Error {
+                            status_code: major_status,
+                            sub_status,
+                            message,
+                        };
                     },
                     Some((fdef_idx, code_offset)) => (fdef_idx.0, code_offset),
                 };
@@ -119,11 +131,16 @@ impl VMError {
                     location: abort_location,
                     function,
                     code_offset,
+                    sub_status,
                     message,
                 }
             },
 
-            (major_status, _, _) => VMStatus::Error(major_status, message),
+            (major_status, sub_status, _) => VMStatus::Error {
+                status_code: major_status,
+                sub_status,
+                message,
+            },
         }
     }
 
@@ -131,8 +148,16 @@ impl VMError {
         self.0.major_status
     }
 
+    pub fn set_major_status(&mut self, major_status: StatusCode) {
+        self.0.major_status = major_status;
+    }
+
     pub fn sub_status(&self) -> Option<u64> {
         self.0.sub_status
+    }
+
+    pub fn set_sub_status(&mut self, status: u64) {
+        self.0.sub_status = Some(status);
     }
 
     pub fn message(&self) -> Option<&String> {
@@ -212,6 +237,70 @@ impl VMError {
             indices,
             offsets,
         }))
+    }
+
+    pub fn format_test_output(&self, verbose: bool, comparison_mode: bool) -> String {
+        let location_string = match &self.location() {
+            Location::Undefined => "undefined".to_owned(),
+            Location::Script => "script".to_owned(),
+            Location::Module(id) => {
+                format!("0x{}::{}", id.address().short_str_lossless(), id.name())
+            },
+        };
+        let indices = if comparison_mode {
+            // During comparison testing, abstract this data.
+            "redacted".to_string()
+        } else {
+            format!("{:?}", self.indices())
+        };
+        let offsets = if comparison_mode {
+            // During comparison testing, abstract this data.
+            "redacted".to_string()
+        } else {
+            format!("{:?}", self.offsets())
+        };
+
+        if verbose {
+            let message_str = match &self.message() {
+                Some(message_str) => message_str,
+                None => "None",
+            };
+            format!(
+                "{{
+    message: {message},
+    major_status: {major_status:?},
+    sub_status: {sub_status:?},
+    location: {location_string},
+    indices: {indices},
+    offsets: {offsets},
+    exec_state: {exec_state:?},
+}}",
+                message = message_str,
+                major_status = self.major_status(),
+                sub_status = self.sub_status(),
+                location_string = location_string,
+                exec_state = self.exec_state(),
+                // TODO maybe include source map info?
+                indices = indices,
+                offsets = offsets,
+            )
+        } else {
+            format!(
+                "{{
+    major_status: {major_status:?},
+    sub_status: {sub_status:?},
+    location: {location_string},
+    indices: {indices},
+    offsets: {offsets},
+}}",
+                major_status = self.major_status(),
+                sub_status = self.sub_status(),
+                location_string = location_string,
+                // TODO maybe include source map info?
+                indices = indices,
+                offsets = offsets,
+            )
+        }
     }
 }
 
@@ -309,10 +398,39 @@ impl PartialVMError {
     }
 
     pub fn new(major_status: StatusCode) -> Self {
+        debug_assert!(major_status != StatusCode::EXECUTED);
+        let message = if major_status == StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR {
+            let mut len = 5;
+            let mut trace: String = "Unknown invariant violation generated:\n".to_string();
+            backtrace::trace(|frame| {
+                backtrace::resolve_frame(frame, |symbol| {
+                    let mut function_name = backtrace::SymbolName::new("<unknown>".as_bytes());
+                    if let Some(name) = symbol.name() {
+                        function_name = name;
+                    }
+                    let mut file_name = "<unknown>";
+                    if let Some(filename) = symbol.filename() {
+                        if let Some(filename) = filename.to_str() {
+                            file_name = filename;
+                        }
+                    }
+                    let lineno = symbol.lineno().unwrap_or(0);
+                    trace.push_str(&format!(
+                        "In function {} at {}:{}\n",
+                        function_name, file_name, lineno
+                    ));
+                });
+                len -= 1;
+                len > 0
+            });
+            Some(trace)
+        } else {
+            None
+        };
         Self(Box::new(PartialVMError_ {
             major_status,
             sub_status: None,
-            message: None,
+            message,
             exec_state: None,
             indices: vec![],
             offsets: vec![],
@@ -323,13 +441,22 @@ impl PartialVMError {
         self.0.major_status
     }
 
+    pub fn sub_status(&self) -> Option<u64> {
+        self.0.sub_status
+    }
+
     pub fn with_sub_status(mut self, sub_status: u64) -> Self {
         debug_assert!(self.0.sub_status.is_none());
         self.0.sub_status = Some(sub_status);
         self
     }
 
-    pub fn with_message(mut self, message: String) -> Self {
+    pub fn with_message(mut self, mut message: String) -> Self {
+        if self.0.major_status == StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR {
+            if let Some(stacktrace) = self.0.message.take() {
+                message = format!("{} @{}", message, stacktrace);
+            }
+        }
         debug_assert!(self.0.message.is_none());
         self.0.message = Some(message);
         self
@@ -339,6 +466,10 @@ impl PartialVMError {
         debug_assert!(self.0.exec_state.is_none());
         self.0.exec_state = Some(exec_state);
         self
+    }
+
+    pub fn message(&self) -> Option<&str> {
+        self.0.message.as_deref()
     }
 
     pub fn at_index(mut self, kind: IndexKind, index: TableIndex) -> Self {
@@ -364,7 +495,7 @@ impl PartialVMError {
         self
     }
 
-    /// Append the message `message` to the message field of the VM status, and insert a seperator
+    /// Append the message `message` to the message field of the VM status, and insert a separator
     /// if the original message is non-empty.
     pub fn append_message_with_separator(
         mut self,

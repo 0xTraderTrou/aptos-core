@@ -8,8 +8,14 @@ pub mod ledger;
 pub mod state_tree;
 pub mod truncate;
 
-use anyhow::Result;
+use aptos_storage_interface::Result;
 use clap::Parser;
+
+#[derive(Parser, Clone)]
+pub struct ShardingConfig {
+    #[clap(long)]
+    enable_storage_sharding: bool,
+}
 
 #[derive(Parser)]
 pub enum Cmd {
@@ -37,4 +43,10 @@ impl Cmd {
             Cmd::Examine(cmd) => cmd.run(),
         }
     }
+}
+
+#[test]
+fn verify_tool() {
+    use clap::CommandFactory;
+    Cmd::command().debug_assert()
 }

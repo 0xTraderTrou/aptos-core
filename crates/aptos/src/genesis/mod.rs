@@ -85,7 +85,7 @@ impl GenesisTool {
 #[derive(Parser)]
 pub struct GenerateGenesis {
     /// Output directory for Genesis file and waypoint
-    #[clap(long, parse(from_os_str))]
+    #[clap(long, value_parser)]
     output_dir: Option<PathBuf>,
     /// Whether this is mainnet genesis.
     ///
@@ -254,9 +254,12 @@ pub fn fetch_mainnet_genesis_info(git_options: GitOptions) -> CliTypedResult<Mai
             voting_power_increase_limit: layout.voting_power_increase_limit,
             employee_vesting_start: layout.employee_vesting_start,
             employee_vesting_period_duration: layout.employee_vesting_period_duration,
-            consensus_config: OnChainConsensusConfig::default(),
-            execution_config: OnChainExecutionConfig::default(),
+            consensus_config: OnChainConsensusConfig::default_for_genesis(),
+            execution_config: OnChainExecutionConfig::default_for_genesis(),
             gas_schedule: default_gas_schedule(),
+            initial_features_override: None,
+            randomness_config_override: None,
+            jwk_consensus_config_override: None,
         },
     )?)
 }
@@ -294,9 +297,12 @@ pub fn fetch_genesis_info(git_options: GitOptions) -> CliTypedResult<GenesisInfo
             voting_power_increase_limit: layout.voting_power_increase_limit,
             employee_vesting_start: layout.employee_vesting_start,
             employee_vesting_period_duration: layout.employee_vesting_period_duration,
-            consensus_config: OnChainConsensusConfig::default(),
-            execution_config: OnChainExecutionConfig::default(),
+            consensus_config: layout.on_chain_consensus_config,
+            execution_config: layout.on_chain_execution_config,
             gas_schedule: default_gas_schedule(),
+            initial_features_override: None,
+            randomness_config_override: None,
+            jwk_consensus_config_override: layout.jwk_consensus_config_override.clone(),
         },
     )?)
 }

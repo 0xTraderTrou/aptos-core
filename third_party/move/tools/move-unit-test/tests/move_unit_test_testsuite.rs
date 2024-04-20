@@ -54,7 +54,13 @@ fn run_test_with_modifiers(
             }
 
             results.push((
-                test_config.run_and_report_unit_tests(test_plan.unwrap(), None, None, buffer)?,
+                test_config.run_and_report_unit_tests(
+                    test_plan.unwrap(),
+                    None,
+                    None,
+                    None,
+                    buffer,
+                )?,
                 modified_exp_path,
             ))
         }
@@ -68,7 +74,7 @@ fn run_test_with_modifiers(
     }
 
     results.push((
-        unit_test_config.run_and_report_unit_tests(test_plan.unwrap(), None, None, buffer)?,
+        unit_test_config.run_and_report_unit_tests(test_plan.unwrap(), None, None, None, buffer)?,
         path.with_extension(EXP_EXT),
     ));
 
@@ -88,7 +94,7 @@ fn run_test_impl(path: &Path) -> anyhow::Result<()> {
         named_address_values: move_stdlib::move_stdlib_named_addresses()
             .into_iter()
             .collect(),
-        report_writeset: true,
+        verbose: true,
         report_stacktrace_on_abort: true,
 
         ..UnitTestingConfig::default_with_bound(None)

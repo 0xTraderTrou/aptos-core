@@ -7,6 +7,7 @@ use crate::{
 };
 
 use aptos_api_test_context::current_function_name;
+use aptos_framework::extended_checks;
 use aptos_protos::extractor::v1::{
     transaction::{TransactionType, TxnData},
     transaction_payload::{Payload, Type as PayloadType},
@@ -220,7 +221,7 @@ async fn test_table_item_parsing_works() {
 async fn make_test_tables(ctx: &mut TestContext, account: &mut LocalAccount) {
     let module = build_test_module(account.address()).await;
 
-    ctx.api_publish_module(account, module.try_into().unwrap())
+    ctx.api_publish_module(account, module.into())
         .await;
     ctx.api_execute_entry_function(
         account,
@@ -245,6 +246,8 @@ async fn build_test_module(account: AccountAddress) -> Vec<u8> {
         generate_docs: false,
         install_dir: Some(package_dir.clone()),
         additional_named_addresses: [("TestAccount".to_string(), account)].into(),
+        known_attributes: extended_checks::get_all_attribute_names().clone(),
+        skip_attribute_checks: false,
         ..Default::default()
     };
     let package = build_config

@@ -36,8 +36,13 @@ on: # build on main branch OR when a PR is labeled with `CICD:build-images`
       - aptos-release-v*
       # experimental branches
       - performance_benchmark
-      - quorum-store
       - preview
+      - preview-networking
+      # grpc release branches
+      - aptos-indexer-grpc-devnet
+      - aptos-indexer-grpc-testnet
+      - aptos-indexer-grpc-mainnet
+      - aptos-indexer-grpc-v*
 
 # cancel redundant builds
 concurrency:
@@ -47,8 +52,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GCP_DOCKER_ARTIFACT_REPO: ${{ secrets.GCP_DOCKER_ARTIFACT_REPO }}
-  GCP_DOCKER_ARTIFACT_REPO_US: ${{ secrets.GCP_DOCKER_ARTIFACT_REPO_US }}
   AWS_ECR_ACCOUNT_NUM: ${{ secrets.ENV_ECR_AWS_ACCOUNT_NUM }}
   # In case of pull_request events by default github actions merges main into the PR branch and then runs the tests etc
   # on the prospective merge result instead of only on the tip of the PR.
@@ -61,6 +64,10 @@ env:
   # We use `pr-<pr_number>` as cache-id for PRs and simply <branch_name> otherwise.
   TARGET_CACHE_ID: ${{ github.event.number && format('pr-{0}', github.event.number) || github.ref_name }}
 
+  # On PRs, only build and push to GCP
+  # On push, build and push to all remote registries
+  TARGET_REGISTRY: ${{ github.event_name == 'pull_request_target' && 'remote' || 'remote-all' }}
+
 permissions:
   contents: read
   id-token: write #required for GCP Workload Identity federation which we use to login into Google Artifact Registry
@@ -71,7 +78,8 @@ permissions:
 # This workflow is designed such that:
 # 1. Run ALL jobs when a 'push', 'workflow_dispatch' triggered the workflow or on 'pull_request's which have set auto_merge=true or have the label "CICD:run-e2e-tests".
 # 2. Run ONLY the docker image building jobs on PRs with the "CICD:build[-<PROFILE/FEATURE>]-images" label.
-# 3. Run NOTHING when neither 1. or 2.'s conditions are satisfied.
+# 3. Run ONLY the forge-e2e-test job on PRs with the "CICD:run-forge-e2e-perf" label.
+# 4. Run NOTHING when neither 1. or 2. or 3. conditions are satisfied.
 jobs:
   permission-check:
     if: |
@@ -99,10 +107,25 @@ jobs:
         run: |
           echo "GIT_SHA: ${GIT_SHA}"
           echo "TARGET_CACHE_ID: ${TARGET_CACHE_ID}"
+          echo "TARGET_REGISTRY: ${TARGET_REGISTRY}"
     outputs:
       gitSha: ${{ env.GIT_SHA }}
       targetCacheId: ${{ env.TARGET_CACHE_ID }}
+      targetRegistry: ${{ env.TARGET_REGISTRY }}
 
+  # This job determines which files were changed
+  file_change_determinator:
+    needs: [permission-check]
+    runs-on: ubuntu-latest
+    outputs:
+      only_docs_changed: ${{ steps.determine_file_changes.outputs.only_docs_changed }}
+    steps:
+      - uses: actions/checkout@v3
+      - name: Run the file change determinator
+        id: determine_file_changes
+        uses: ./.github/actions/file-change-determinator
+
+  # This is a PR required job.
   rust-images:
     needs: [permission-check, determine-docker-build-metadata]
     uses: aptos-labs/aptos-core/.github/workflows/workflow-run-docker-rust-build.yaml@main
@@ -112,21 +135,7 @@ jobs:
       TARGET_CACHE_ID: ${{ needs.determine-docker-build-metadata.outputs.targetCacheId }}
       PROFILE: release
       BUILD_ADDL_TESTING_IMAGES: true
-
-  rust-images-indexer:
-    needs: [permission-check, determine-docker-build-metadata]
-    uses: aptos-labs/aptos-core/.github/workflows/workflow-run-docker-rust-build.yaml@main
-    if: |
-      github.event_name == 'push' ||
-      github.event_name == 'workflow_dispatch' ||
-      contains(github.event.pull_request.labels.*.name, 'CICD:build-indexer-images')
-    secrets: inherit
-    with:
-      GIT_SHA: ${{ needs.determine-docker-build-metadata.outputs.gitSha }}
-      TARGET_CACHE_ID: ${{ needs.determine-docker-build-metadata.outputs.targetCacheId }}
-      PROFILE: release
-      FEATURES: indexer
-      BUILD_ADDL_TESTING_IMAGES: true
+      TARGET_REGISTRY: ${{ needs.determine-docker-build-metadata.outputs.targetRegistry }}
 
   rust-images-failpoints:
     needs: [permission-check, determine-docker-build-metadata]
@@ -142,6 +151,7 @@ jobs:
       PROFILE: release
       FEATURES: failpoints
       BUILD_ADDL_TESTING_IMAGES: true
+      TARGET_REGISTRY: ${{ needs.determine-docker-build-metadata.outputs.targetRegistry }}
 
   rust-images-performance:
     needs: [permission-check, determine-docker-build-metadata]
@@ -156,6 +166,7 @@ jobs:
       TARGET_CACHE_ID: ${{ needs.determine-docker-build-metadata.outputs.targetCacheId }}
       PROFILE: performance
       BUILD_ADDL_TESTING_IMAGES: true
+      TARGET_REGISTRY: ${{ needs.determine-docker-build-metadata.outputs.targetRegistry }}
 
   rust-images-consensus-only-perf-test:
     needs: [permission-check, determine-docker-build-metadata]
@@ -170,22 +181,28 @@ jobs:
       PROFILE: release
       FEATURES: consensus-only-perf-test
       BUILD_ADDL_TESTING_IMAGES: true
+      TARGET_REGISTRY: ${{ needs.determine-docker-build-metadata.outputs.targetRegistry }}
 
-  sdk-release:
-    needs: [permission-check, rust-images, determine-docker-build-metadata] # runs with the default release docker build variant "rust-images"
+  # This is a PR required job.
+  node-api-compatibility-tests:
+    needs: [permission-check, rust-images, determine-docker-build-metadata, file_change_determinator] # runs with the default release docker build variant "rust-images"
     if: |
-      (github.event_name == 'push' && github.ref_name != 'main') ||
-      github.event_name == 'workflow_dispatch' ||
-      contains(github.event.pull_request.labels.*.name, 'CICD:run-e2e-tests') ||
-      github.event.pull_request.auto_merge != null ||
-      contains(github.event.pull_request.body, '#e2e')
-    uses: aptos-labs/aptos-core/.github/workflows/sdk-release.yaml@main
+      (
+        github.event_name == 'push' ||
+        github.event_name == 'workflow_dispatch' ||
+        contains(github.event.pull_request.labels.*.name, 'CICD:run-e2e-tests') ||
+        github.event.pull_request.auto_merge != null) ||
+        contains(github.event.pull_request.body, '#e2e'
+      )
+    uses: ./.github/workflows/node-api-compatibility-tests.yaml
     secrets: inherit
     with:
       GIT_SHA: ${{ needs.determine-docker-build-metadata.outputs.gitSha }}
+      SKIP_JOB: ${{ needs.file_change_determinator.outputs.only_docs_changed == 'true' }}
 
+  # This is a PR required job.
   cli-e2e-tests:
-    needs: [permission-check, rust-images, determine-docker-build-metadata] # runs with the default release docker build variant "rust-images"
+    needs: [permission-check, rust-images, determine-docker-build-metadata, file_change_determinator] # runs with the default release docker build variant "rust-images"
     if: |
       (
         github.event_name == 'push' ||
@@ -198,34 +215,51 @@ jobs:
     secrets: inherit
     with:
       GIT_SHA: ${{ needs.determine-docker-build-metadata.outputs.gitSha }}
+      SKIP_JOB: ${{ needs.file_change_determinator.outputs.only_docs_changed == 'true' }}
+
+  faucet-tests-main:
+    needs: [permission-check, rust-images, determine-docker-build-metadata, file_change_determinator] # runs with the default release docker build variant "rust-images"
+    if: |
+      (
+        github.event_name == 'push' ||
+        github.event_name == 'workflow_dispatch' ||
+        contains(github.event.pull_request.labels.*.name, 'CICD:run-e2e-tests') ||
+        github.event.pull_request.auto_merge != null) ||
+        contains(github.event.pull_request.body, '#e2e'
+      )
+    uses: ./.github/workflows/faucet-tests-main.yaml
+    secrets: inherit
+    with:
+      GIT_SHA: ${{ needs.determine-docker-build-metadata.outputs.gitSha }}
+      SKIP_JOB: ${{ needs.file_change_determinator.outputs.only_docs_changed == 'true' }}
 
   indexer-grpc-e2e-tests:
     needs: [permission-check, rust-images, determine-docker-build-metadata] # runs with the default release docker build variant "rust-images"
     if: |
-      (github.event_name == 'push' && github.ref_name != 'main') ||
       github.event_name == 'workflow_dispatch' ||
       contains(github.event.pull_request.labels.*.name, 'CICD:run-e2e-tests') ||
-      github.event.pull_request.auto_merge != null ||
       contains(github.event.pull_request.body, '#e2e')
-    uses: ./.github/workflows/docker-indexer-grpc-test.yaml
+    uses: aptos-labs/aptos-core/.github/workflows/docker-indexer-grpc-test.yaml@main
     secrets: inherit
     with:
       GIT_SHA: ${{ needs.determine-docker-build-metadata.outputs.gitSha }}
 
+  # This is a PR required job.
   forge-e2e-test:
     needs:
       - permission-check
       - determine-docker-build-metadata
       - rust-images
-      - rust-images-indexer
       - rust-images-failpoints
       - rust-images-performance
       - rust-images-consensus-only-perf-test
+      - file_change_determinator
     if: |
       !failure() && !cancelled() && needs.permission-check.result == 'success' && (
         (github.event_name == 'push' && github.ref_name != 'main') ||
         github.event_name == 'workflow_dispatch' ||
         contains(github.event.pull_request.labels.*.name, 'CICD:run-e2e-tests') ||
+        contains(github.event.pull_request.labels.*.name, 'CICD:run-forge-e2e-perf') ||
         github.event.pull_request.auto_merge != null ||
         contains(github.event.pull_request.body, '#e2e')
       )
@@ -233,7 +267,7 @@ jobs:
     secrets: inherit
     with:
       GIT_SHA: ${{ needs.determine-docker-build-metadata.outputs.gitSha }}
-      FORGE_TEST_SUITE: land_blocking
+      FORGE_TEST_SUITE: realistic_env_max_load
       IMAGE_TAG: ${{ needs.determine-docker-build-metadata.outputs.gitSha }}
       FORGE_RUNNER_DURATION_SECS: 480
       COMMENT_HEADER: forge-e2e
@@ -241,17 +275,18 @@ jobs:
       # test lifecycle is separate from that of GHA. This protects us from the case where many Forge tests are triggered
       # by this GHA. If there is a Forge namespace collision, Forge will pre-empt the existing test running in the namespace.
       FORGE_NAMESPACE: forge-e2e-${{ needs.determine-docker-build-metadata.outputs.targetCacheId }}
+      SKIP_JOB: ${{ needs.file_change_determinator.outputs.only_docs_changed == 'true' }}
 
-  # Run e2e compat test against testnet branch
+  # Run e2e compat test against testnet branch. This is a PR required job.
   forge-compat-test:
     needs:
       - permission-check
       - determine-docker-build-metadata
       - rust-images
-      - rust-images-indexer
       - rust-images-failpoints
       - rust-images-performance
       - rust-images-consensus-only-perf-test
+      - file_change_determinator
     if: |
       !failure() && !cancelled() && needs.permission-check.result == 'success' && (
         (github.event_name == 'push' && github.ref_name != 'main') ||
@@ -265,45 +300,44 @@ jobs:
     with:
       GIT_SHA: ${{ needs.determine-docker-build-metadata.outputs.gitSha }}
       FORGE_TEST_SUITE: compat
-      IMAGE_TAG: testnet_2d8b1b57553d869190f61df1aaf7f31a8fc19a7b # test against a previous testnet release
+      IMAGE_TAG: aptos-node-v1.10.1 # test against a previous testnet release
       FORGE_RUNNER_DURATION_SECS: 300
       COMMENT_HEADER: forge-compat
       FORGE_NAMESPACE: forge-compat-${{ needs.determine-docker-build-metadata.outputs.targetCacheId }}
+      SKIP_JOB: ${{ needs.file_change_determinator.outputs.only_docs_changed == 'true' }}
 
-  # Run forge framework upgradability test
+  # Run forge framework upgradability test. This is a PR required job.
   forge-framework-upgrade-test:
     needs:
       - permission-check
       - determine-docker-build-metadata
       - rust-images
-      - rust-images-indexer
       - rust-images-failpoints
       - rust-images-performance
       - rust-images-consensus-only-perf-test
+      - file_change_determinator
     if: |
       !failure() && !cancelled() && needs.permission-check.result == 'success' && (
         (github.event_name == 'push' && github.ref_name != 'main') ||
         github.event_name == 'workflow_dispatch' ||
-        contains(github.event.pull_request.labels.*.name, 'CICD:run-e2e-tests') ||
-        github.event.pull_request.auto_merge != null ||
-        contains(github.event.pull_request.body, '#e2e')
+        contains(github.event.pull_request.labels.*.name, 'CICD:run-framework-upgrade-test')
       )
     uses: aptos-labs/aptos-core/.github/workflows/workflow-run-forge.yaml@main
     secrets: inherit
     with:
       GIT_SHA: ${{ needs.determine-docker-build-metadata.outputs.gitSha }}
       FORGE_TEST_SUITE: framework_upgrade
-      IMAGE_TAG: aptos-node-v1.3.0_3fc3d42b6cfe27460004f9a0326451bcda840a60 # This workflow will test the upgradability from the current tip of the release branch to the current main branch.
-      FORGE_RUNNER_DURATION_SECS: 300
+      IMAGE_TAG: aptos-node-v1.10.1 # This workflow will test the upgradability from the current tip of the release branch to the current main branch.
+      FORGE_RUNNER_DURATION_SECS: 3600
       COMMENT_HEADER: forge-framework-upgrade
       FORGE_NAMESPACE: forge-framework-upgrade-${{ needs.determine-docker-build-metadata.outputs.targetCacheId }}
+      SKIP_JOB: ${{ needs.file_change_determinator.outputs.only_docs_changed == 'true' }}
 
   forge-consensus-only-perf-test:
     needs:
       - permission-check
       - determine-docker-build-metadata
       - rust-images
-      - rust-images-indexer
       - rust-images-failpoints
       - rust-images-performance
       - rust-images-consensus-only-perf-test
@@ -314,8 +348,31 @@ jobs:
     secrets: inherit
     with:
       GIT_SHA: ${{ needs.determine-docker-build-metadata.outputs.gitSha }}
-      FORGE_TEST_SUITE: consensus_only_perf_benchmark
+      FORGE_TEST_SUITE: consensus_only_realistic_env_max_tps
       IMAGE_TAG: consensus_only_perf_test_${{ needs.determine-docker-build-metadata.outputs.gitSha }}
       FORGE_RUNNER_DURATION_SECS: 300
-      COMMENT_HEADER: forge-consensus-only-perf-test
-      FORGE_NAMESPACE: forge-consensus-only-perf-test-${{ needs.determine-docker-build-metadata.outputs.targetCacheId }}
+      COMMENT_HEADER: consensus-only-realistic-env-max-tps
+      FORGE_NAMESPACE: forge-consensus-only-realistic-env-max-tps-${{ needs.determine-docker-build-metadata.outputs.targetCacheId }}
+
+  # Run forge multiregion test. This test uses the multiregion forge cluster that deploys pods in three GCP regions.
+  forge-multiregion-test:
+    needs:
+      - permission-check
+      - determine-docker-build-metadata
+      - rust-images
+      - rust-images-failpoints
+      - rust-images-performance
+      - rust-images-consensus-only-perf-test
+    if: |
+      !failure() && !cancelled() && needs.permission-check.result == 'success' &&
+      contains(github.event.pull_request.labels.*.name, 'CICD:run-multiregion-test')
+    uses: aptos-labs/aptos-core/.github/workflows/workflow-run-forge.yaml@main
+    secrets: inherit
+    with:
+      GIT_SHA: ${{ needs.determine-docker-build-metadata.outputs.gitSha }}
+      FORGE_TEST_SUITE: multiregion_benchmark_test
+      IMAGE_TAG: ${{ needs.determine-docker-build-metadata.outputs.gitSha }}
+      FORGE_RUNNER_DURATION_SECS: 300
+      COMMENT_HEADER: forge-multiregion-test
+      FORGE_NAMESPACE: forge-multiregion-test-${{ needs.determine-docker-build-metadata.outputs.targetCacheId }}
+      FORGE_CLUSTER_NAME: forge-multiregion

@@ -11,7 +11,7 @@ use crate::{
 use aptos_channels::{aptos_channel, message_queues::QueueStyle};
 use aptos_config::{
     config::{Identity, NodeConfig, PeerRole, RoleType},
-    network_id::{NetworkContext, NetworkId, PeerNetworkId},
+    network_id::{NetworkId, PeerNetworkId},
 };
 use aptos_crypto::{x25519::PrivateKey, Uniform};
 use aptos_event_notifications::{ReconfigNotification, ReconfigNotificationListener};
@@ -23,8 +23,8 @@ use aptos_network::{
         storage::PeersAndMetadata,
     },
     peer_manager::{
-        conn_notifs_channel, ConnectionNotification, ConnectionRequestSender,
-        PeerManagerNotification, PeerManagerRequest, PeerManagerRequestSender,
+        ConnectionRequestSender, PeerManagerNotification, PeerManagerRequest,
+        PeerManagerRequestSender,
     },
     protocols::{
         network::{NetworkEvents, NetworkSender, NewNetworkEvents, NewNetworkSender},
@@ -34,7 +34,10 @@ use aptos_network::{
     ProtocolId,
 };
 use aptos_storage_interface::mock::MockDbReaderWriter;
-use aptos_types::{on_chain_config::OnChainConfigPayload, PeerId};
+use aptos_types::{
+    on_chain_config::{InMemoryOnChainConfig, OnChainConfigPayload},
+    PeerId,
+};
 use aptos_vm_validator::mocks::mock_vm_validator::MockVMValidator;
 use enum_dispatch::enum_dispatch;
 use futures::{
@@ -347,8 +350,12 @@ impl Node {
     pub fn new(node: NodeInfo, config: NodeConfig) -> Node {
         let (network_interfaces, network_client, network_service_events, peers_and_metadata) =
             setup_node_network_interfaces(&node);
-        let (mempool, runtime, subscriber) =
-            start_node_mempool(config, network_client, network_service_events);
+        let (mempool, runtime, subscriber) = start_node_mempool(
+            config,
+            network_client,
+            network_service_events,
+            peers_and_metadata.clone(),
+        );
 
         Node {
             node_info: node,
@@ -395,16 +402,9 @@ impl Node {
         metadata
             .application_protocols
             .insert(ProtocolId::MempoolDirectSend);
-        let notif = ConnectionNotification::NewPeer(metadata.clone(), NetworkContext::mock());
         self.peers_and_metadata
             .insert_connection_metadata(peer_network_id, metadata)
             .unwrap();
-        self.send_connection_event(peer_network_id.network_id(), notif);
-    }
-
-    /// Sends a connection event, and waits for the notification to arrive
-    fn send_connection_event(&mut self, network_id: NetworkId, notif: ConnectionNotification) {
-        self.send_network_notif(network_id, notif);
         self.wait_for_event(SharedMempoolNotification::PeerStateChange);
     }
 
@@ -415,7 +415,10 @@ impl Node {
             return;
         }
 
-        panic!("Failed to get expected event '{:?}'", expected)
+        panic!(
+            "Failed to get expected event '{:?}', instead: '{:?}'",
+            expected, event
+        )
     }
 
     /// Checks that there are no `SharedMempoolNotification`s on the subscriber
@@ -456,12 +459,6 @@ impl Node {
         self.get_network_interface(network_id)
             .send_network_req(protocol, notif);
     }
-
-    /// Sends a `ConnectionNotification` to the local node
-    pub fn send_network_notif(&mut self, network_id: NetworkId, notif: ConnectionNotification) {
-        self.get_network_interface(network_id)
-            .send_connection_notif(notif)
-    }
 }
 
 /// A simplistic view of the entire network stack for a given `NetworkId`
@@ -472,8 +469,6 @@ pub struct NodeNetworkInterface {
     /// Peer notification sender for sending outgoing messages to other peers
     pub(crate) network_notifs_tx:
         aptos_channel::Sender<(PeerId, ProtocolId), PeerManagerNotification>,
-    /// Sender for connecting / disconnecting peers
-    pub(crate) network_conn_event_notifs_tx: conn_notifs_channel::Sender,
 }
 
 impl NodeNetworkInterface {
@@ -489,18 +484,6 @@ impl NodeNetworkInterface {
 
         self.network_notifs_tx
             .push((remote_peer_id, protocol), message)
-            .unwrap()
-    }
-
-    /// Send a notification specifying, where a remote peer has it's state changed
-    fn send_connection_notif(&mut self, notif: ConnectionNotification) {
-        let peer_id = match &notif {
-            ConnectionNotification::NewPeer(metadata, _) => metadata.remote_peer_id,
-            ConnectionNotification::LostPeer(metadata, _, _) => metadata.remote_peer_id,
-        };
-
-        self.network_conn_event_notifs_tx
-            .push(peer_id, notif)
             .unwrap()
     }
 }
@@ -554,24 +537,23 @@ fn setup_node_network_interfaces(
 fn setup_node_network_interface(
     peer_network_id: PeerNetworkId,
 ) -> (NodeNetworkInterface, MempoolNetworkHandle) {
+    // Create the network sender and events receiver
     static MAX_QUEUE_SIZE: usize = 8;
     let (network_reqs_tx, network_reqs_rx) =
         aptos_channel::new(QueueStyle::FIFO, MAX_QUEUE_SIZE, None);
     let (connection_reqs_tx, _) = aptos_channel::new(QueueStyle::FIFO, MAX_QUEUE_SIZE, None);
     let (network_notifs_tx, network_notifs_rx) =
         aptos_channel::new(QueueStyle::FIFO, MAX_QUEUE_SIZE, None);
-    let (network_conn_event_notifs_tx, conn_status_rx) = conn_notifs_channel::new();
     let network_sender = NetworkSender::new(
         PeerManagerRequestSender::new(network_reqs_tx),
         ConnectionRequestSender::new(connection_reqs_tx),
     );
-    let network_events = NetworkEvents::new(network_notifs_rx, conn_status_rx);
+    let network_events = NetworkEvents::new(network_notifs_rx, None);
 
     (
         NodeNetworkInterface {
             network_reqs_rx,
             network_notifs_tx,
-            network_conn_event_notifs_tx,
         },
         (peer_network_id.network_id(), network_sender, network_events),
     )
@@ -582,6 +564,7 @@ fn start_node_mempool(
     config: NodeConfig,
     network_client: NetworkClient<MempoolSyncMsg>,
     network_service_events: NetworkServiceEvents<MempoolSyncMsg>,
+    peers_and_metadata: Arc<PeersAndMetadata>,
 ) -> (
     Arc<Mutex<CoreMempool>>,
     Runtime,
@@ -592,7 +575,7 @@ fn start_node_mempool(
     let (_ac_endpoint_sender, ac_endpoint_receiver) = mpsc::channel(1_024);
     let (_quorum_store_sender, quorum_store_receiver) = mpsc::channel(1_024);
     let (_mempool_notifier, mempool_listener) =
-        aptos_mempool_notifications::new_mempool_notifier_listener_pair();
+        aptos_mempool_notifications::new_mempool_notifier_listener_pair(100);
     let (reconfig_sender, reconfig_events) = aptos_channel::new(QueueStyle::LIFO, 1, None);
     let reconfig_event_subscriber = ReconfigNotificationListener {
         notification_receiver: reconfig_events,
@@ -600,7 +583,10 @@ fn start_node_mempool(
     reconfig_sender
         .push((), ReconfigNotification {
             version: 1,
-            on_chain_configs: OnChainConfigPayload::new(1, Arc::new(HashMap::new())),
+            on_chain_configs: OnChainConfigPayload::new(
+                1,
+                InMemoryOnChainConfig::new(HashMap::new()),
+            ),
         })
         .unwrap();
 
@@ -618,6 +604,7 @@ fn start_node_mempool(
         Arc::new(MockDbReaderWriter),
         Arc::new(RwLock::new(MockVMValidator)),
         vec![sender],
+        peers_and_metadata,
     );
 
     (mempool, runtime, subscriber)

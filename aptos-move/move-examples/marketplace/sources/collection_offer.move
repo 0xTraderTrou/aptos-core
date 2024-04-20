@@ -11,9 +11,9 @@ module collection_offer {
     use std::option::{Self, Option};
     use std::signer;
     use std::string::String;
+    use aptos_std::math64;
 
     use aptos_framework::coin::{Self, Coin};
-    use aptos_framework::event::{Self, EventHandle};
     use aptos_framework::object::{Self, DeleteRef, Object};
     use aptos_framework::timestamp;
 
@@ -23,8 +23,10 @@ module collection_offer {
     use aptos_token_objects::royalty;
     use aptos_token_objects::token::{Self as tokenv2, Token as TokenV2};
 
+    use marketplace::events;
     use marketplace::fee_schedule::{Self, FeeSchedule};
     use marketplace::listing::{Self, TokenV1Container};
+    use aptos_framework::aptos_account;
 
     /// No collection offer defined.
     const ENO_COLLECTION_OFFER: u64 = 1;
@@ -42,7 +44,7 @@ module collection_offer {
     // Core data structures
 
     #[resource_group_member(group = aptos_framework::object::ObjectGroup)]
-    /// Create a limed lifetime offer to buy tokens from a collection. The collection and
+    /// Create a timed offer to buy tokens from a collection. The collection and
     /// assets used to buy are stored in other resources within the object.
     struct CollectionOffer has key {
         fee_schedule: Object<FeeSchedule>,
@@ -50,15 +52,6 @@ module collection_offer {
         remaining: u64,
         expiration_time: u64,
         delete_ref: DeleteRef,
-        events: EventHandle<CollectionOfferEvent>,
-    }
-
-    /// An event for when a collection offer has been met.
-    struct CollectionOfferEvent has drop, store {
-        seller: address,
-        price: u64,
-        royalties: u64,
-        commission: u64,
     }
 
     #[resource_group_member(group = aptos_framework::object::ObjectGroup)]
@@ -82,9 +75,28 @@ module collection_offer {
 
     // Initializers
 
-    #[legacy_entry_fun]
     /// Create a tokenv1 collection offer.
-    public entry fun init_for_tokenv1<CoinType>(
+    public entry fun init_for_tokenv1_entry<CoinType>(
+        purchaser: &signer,
+        creator_address: address,
+        collection_name: String,
+        fee_schedule: Object<FeeSchedule>,
+        item_price: u64,
+        amount: u64,
+        expiration_time: u64,
+    ) {
+        init_for_tokenv1<CoinType>(
+            purchaser,
+            creator_address,
+            collection_name,
+            fee_schedule,
+            item_price,
+            amount,
+            expiration_time
+        );
+    }
+
+    public fun init_for_tokenv1<CoinType>(
         purchaser: &signer,
         creator_address: address,
         collection_name: String,
@@ -96,12 +108,40 @@ module collection_offer {
         let offer_signer = init_offer(purchaser, fee_schedule, item_price, amount, expiration_time);
         init_coin_holder<CoinType>(purchaser, &offer_signer, fee_schedule, item_price * amount);
         move_to(&offer_signer, CollectionOfferTokenV1 { creator_address, collection_name });
-        object::address_to_object(signer::address_of(&offer_signer))
+
+        let collection_offer_addr = signer::address_of(&offer_signer);
+        events::emit_collection_offer_placed(
+            fee_schedule,
+            collection_offer_addr,
+            signer::address_of(purchaser),
+            item_price,
+            amount,
+            events::collection_metadata_for_tokenv1(creator_address, collection_name),
+        );
+
+        object::address_to_object(collection_offer_addr)
     }
 
-    #[legacy_entry_fun]
     /// Create a tokenv2 collection offer.
-    public entry fun init_for_tokenv2<CoinType>(
+    public entry fun init_for_tokenv2_entry<CoinType>(
+        purchaser: &signer,
+        collection: Object<Collection>,
+        fee_schedule: Object<FeeSchedule>,
+        item_price: u64,
+        amount: u64,
+        expiration_time: u64,
+    ) {
+        init_for_tokenv2<CoinType>(
+            purchaser,
+            collection,
+            fee_schedule,
+            item_price,
+            amount,
+            expiration_time
+        );
+    }
+
+    public fun init_for_tokenv2<CoinType>(
         purchaser: &signer,
         collection: Object<Collection>,
         fee_schedule: Object<FeeSchedule>,
@@ -112,7 +152,18 @@ module collection_offer {
         let offer_signer = init_offer(purchaser, fee_schedule, item_price, amount, expiration_time);
         init_coin_holder<CoinType>(purchaser, &offer_signer, fee_schedule, item_price * amount);
         move_to(&offer_signer, CollectionOfferTokenV2 { collection });
-        object::address_to_object(signer::address_of(&offer_signer))
+
+        let collection_offer_addr = signer::address_of(&offer_signer);
+        events::emit_collection_offer_placed(
+            fee_schedule,
+            collection_offer_addr,
+            signer::address_of(purchaser),
+            item_price,
+            amount,
+            events::collection_metadata_for_tokenv2(collection),
+        );
+
+        object::address_to_object(collection_offer_addr)
     }
 
     inline fun init_offer(
@@ -134,7 +185,6 @@ module collection_offer {
             remaining: amount,
             expiration_time,
             delete_ref: object::generate_delete_ref(&constructor_ref),
-            events: object::new_event_handle(&offer_signer),
         };
         move_to(&offer_signer, offer);
 
@@ -149,7 +199,7 @@ module collection_offer {
     ) {
         let fee = fee_schedule::listing_fee(fee_schedule, total_to_extract);
         let fee_address = fee_schedule::fee_address(fee_schedule);
-        coin::transfer<CoinType>(purchaser, fee_address, fee);
+        aptos_account::transfer_coins<CoinType>(purchaser, fee_address, fee);
 
         let coins = coin::withdraw<CoinType>(purchaser, total_to_extract);
         move_to(offer_signer, CoinOffer { coins });
@@ -171,23 +221,54 @@ module collection_offer {
             object::is_owner(collection_offer, signer::address_of(purchaser)),
             error::permission_denied(ENOT_OWNER),
         );
+        let collection_offer_obj = borrow_global_mut<CollectionOffer>(collection_offer_addr);
+        let collection_metadata = if (exists<CollectionOfferTokenV2>(collection_offer_addr)) {
+            events::collection_metadata_for_tokenv2(
+                borrow_global<CollectionOfferTokenV2>(collection_offer_addr).collection,
+            )
+        } else {
+            let offer_info = borrow_global<CollectionOfferTokenV1>(collection_offer_addr);
+            events::collection_metadata_for_tokenv1(
+                offer_info.creator_address,
+                offer_info.collection_name,
+            )
+        };
+
+        events::emit_collection_offer_canceled(
+            collection_offer_obj.fee_schedule,
+            collection_offer_addr,
+            signer::address_of(purchaser),
+            collection_offer_obj.item_price,
+            collection_offer_obj.remaining,
+            collection_metadata,
+        );
 
         cleanup<CoinType>(collection_offer);
     }
 
-    #[legacy_entry_fun]
     /// Sell a tokenv1 to a collection offer.
-    public entry fun sell_tokenv1<CoinType>(
+    public entry fun sell_tokenv1_entry<CoinType>(
+        seller: &signer,
+        collection_offer: Object<CollectionOffer>,
+        token_name: String,
+        property_version: u64,
+    ) acquires CoinOffer, CollectionOffer, CollectionOfferTokenV1, CollectionOfferTokenV2
+    {
+        sell_tokenv1<CoinType>(seller, collection_offer, token_name, property_version);
+    }
+
+    /// Sell a tokenv1 to a collection offer.
+    public fun sell_tokenv1<CoinType>(
         seller: &signer,
         collection_offer: Object<CollectionOffer>,
         token_name: String,
         property_version: u64,
     ): Option<Object<TokenV1Container>>
-        acquires
-            CoinOffer,
-            CollectionOffer,
-            CollectionOfferTokenV1,
-            CollectionOfferTokenV2
+    acquires
+    CoinOffer,
+    CollectionOffer,
+    CollectionOfferTokenV1,
+    CollectionOfferTokenV2
     {
         let collection_offer_addr = object::object_address(&collection_offer);
         assert!(
@@ -222,11 +303,13 @@ module collection_offer {
 
         let royalty = tokenv1::get_royalty(token_id);
         settle_payments<CoinType>(
+            object::owner(collection_offer),
             signer::address_of(seller),
             collection_offer_addr,
             tokenv1::get_royalty_payee(&royalty),
             tokenv1::get_royalty_denominator(&royalty),
             tokenv1::get_royalty_numerator(&royalty),
+            events::token_metadata_for_tokenv1(token_id),
         );
 
         container
@@ -269,11 +352,13 @@ module collection_offer {
         };
 
         settle_payments<CoinType>(
+            object::owner(collection_offer),
             signer::address_of(seller),
             collection_offer_addr,
             royalty_payee,
             royalty_denominator,
             royalty_numerator,
+            events::token_metadata_for_tokenv2(token),
         );
     }
 
@@ -281,13 +366,15 @@ module collection_offer {
     /// the creator for royalties, and the marketplace for commission. If there are no more slots,
     /// cleanup the offer.
     inline fun settle_payments<CoinType>(
+        buyer: address,
         seller: address,
         collection_offer_addr: address,
         royalty_payee: address,
         royalty_denominator: u64,
         royalty_numerator: u64,
+        token_metadata: events::TokenMetadata,
     ) acquires CoinOffer, CollectionOffer, CollectionOfferTokenV1, CollectionOfferTokenV2 {
-        assert!(exists<CollectionOffer>(collection_offer_addr), 0);
+        assert!(exists<CollectionOffer>(collection_offer_addr), error::not_found(ENO_COLLECTION_OFFER));
         let collection_offer_obj = borrow_global_mut<CollectionOffer>(collection_offer_addr);
         assert!(
             timestamp::now_seconds() < collection_offer_obj.expiration_time,
@@ -302,24 +389,31 @@ module collection_offer {
         let coin_offer = borrow_global_mut<CoinOffer<CoinType>>(collection_offer_addr);
         let coins = coin::extract(&mut coin_offer.coins, price);
 
-        let royalty_charge = price * royalty_numerator / royalty_denominator;
-        let royalties = coin::extract(&mut coins, royalty_charge);
-        coin::deposit(royalty_payee, royalties);
+        let royalty_charge = listing::bounded_percentage(price, royalty_numerator, royalty_denominator);
 
+        let royalties = coin::extract(&mut coins, royalty_charge);
+        aptos_account::deposit_coins(royalty_payee, royalties);
+
+        // Commission can only be of whatever is left
         let fee_schedule = collection_offer_obj.fee_schedule;
         let commission_charge = fee_schedule::commission(fee_schedule, price);
-        let commission = coin::extract(&mut coins, commission_charge);
-        coin::deposit(fee_schedule::fee_address(fee_schedule), commission);
+        let actual_commission_charge = math64::min(commission_charge, coin::value(&coins));
+        let commission = coin::extract(&mut coins, actual_commission_charge);
+        aptos_account::deposit_coins(fee_schedule::fee_address(fee_schedule), commission);
 
-        coin::deposit(seller, coins);
+        // Seller gets what is left
+        aptos_account::deposit_coins(seller, coins);
 
-        let event = CollectionOfferEvent {
+        events::emit_collection_offer_filled(
+            fee_schedule,
+            collection_offer_addr,
+            buyer,
             seller,
             price,
-            royalties: royalty_charge,
-            commission: commission_charge,
-        };
-        event::emit_event(&mut collection_offer_obj.events, event);
+            royalty_charge,
+            commission_charge,
+            token_metadata,
+        );
 
         collection_offer_obj.remaining = collection_offer_obj.remaining - 1;
         if (collection_offer_obj.remaining == 0) {
@@ -334,7 +428,7 @@ module collection_offer {
     ) acquires CoinOffer, CollectionOffer, CollectionOfferTokenV1, CollectionOfferTokenV2 {
         let collection_offer_addr = object::object_address(&collection_offer);
         let CoinOffer<CoinType> { coins } = move_from(collection_offer_addr);
-        coin::deposit(object::owner(collection_offer), coins);
+        aptos_account::deposit_coins(object::owner(collection_offer), coins);
 
         let CollectionOffer {
             fee_schedule: _,
@@ -342,9 +436,7 @@ module collection_offer {
             remaining: _,
             expiration_time: _,
             delete_ref,
-            events,
         } = move_from(collection_offer_addr);
-        event::destroy_handle(events);
         object::delete(delete_ref);
 
         if (exists<CollectionOfferTokenV2>(collection_offer_addr)) {
@@ -429,17 +521,16 @@ module collection_offer {
 #[test_only]
 module collection_offer_tests {
     use std::string;
+    use std::option;
 
     use aptos_framework::aptos_coin::AptosCoin;
     use aptos_framework::coin;
     use aptos_framework::object;
-    use aptos_framework::option;
     use aptos_framework::timestamp;
 
     use aptos_token::token as tokenv1;
 
     use aptos_token_objects::collection as collectionv2;
-    use aptos_token_objects::token as tokenv2;
 
     use marketplace::collection_offer;
     use marketplace::listing;
@@ -454,11 +545,11 @@ module collection_offer_tests {
     ) {
         let (marketplace_addr, seller_addr, purchaser_addr) =
             test_utils::setup(aptos_framework, marketplace, seller, purchaser);
-        let token = test_utils::mint_tokenv2(seller);
+        let (collection, token) = test_utils::mint_tokenv2_with_collection(seller);
         assert!(object::is_owner(token, seller_addr), 0);
         let collection_offer = collection_offer::init_for_tokenv2<AptosCoin>(
             purchaser,
-            tokenv2::collection_object(token),
+            collection,
             test_utils::fee_schedule(marketplace),
             500,
             2,
@@ -484,6 +575,43 @@ module collection_offer_tests {
         assert!(coin::balance<AptosCoin>(marketplace_addr) == 11, 0);
         assert!(coin::balance<AptosCoin>(purchaser_addr) == 9489, 0);
         assert!(coin::balance<AptosCoin>(seller_addr) == 10500, 0);
+        assert!(object::is_owner(token, purchaser_addr), 0);
+        assert!(!collection_offer::exists_at(collection_offer), 0);
+    }
+
+    #[test(aptos_framework = @0x1, marketplace = @0x111, seller = @0x222, purchaser = @0x333)]
+    fun test_token_v2_high_royalty(
+        aptos_framework: &signer,
+        marketplace: &signer,
+        seller: &signer,
+        purchaser: &signer,
+    ) {
+        let (marketplace_addr, seller_addr, purchaser_addr) =
+            test_utils::setup(aptos_framework, marketplace, seller, purchaser);
+        let (collection, token) = test_utils::mint_tokenv2_with_collection_royalty(seller, 1, 1);
+        assert!(object::is_owner(token, seller_addr), 0);
+        let collection_offer = collection_offer::init_for_tokenv2<AptosCoin>(
+            purchaser,
+            collection,
+            test_utils::fee_schedule(marketplace),
+            500,
+            2,
+            timestamp::now_seconds() + 200,
+        );
+        assert!(!collection_offer::expired(collection_offer), 0);
+        assert!(collection_offer::expiration_time(collection_offer) == timestamp::now_seconds() + 200, 0);
+        assert!(collection_offer::price(collection_offer) == 500, 0);
+
+        assert!(collection_offer::remaining(collection_offer) == 2, 0);
+        assert!(coin::balance<AptosCoin>(marketplace_addr) == 1, 0);
+        assert!(coin::balance<AptosCoin>(purchaser_addr) == 8999, 0);
+        assert!(coin::balance<AptosCoin>(seller_addr) == 10000, 0);
+
+        collection_offer::sell_tokenv2<AptosCoin>(seller, collection_offer, token);
+        assert!(object::is_owner(token, purchaser_addr), 0);
+        assert!(collection_offer::remaining(collection_offer) == 1, 0);
+
+        collection_offer::sell_tokenv2<AptosCoin>(purchaser, collection_offer, token);
         assert!(object::is_owner(token, purchaser_addr), 0);
         assert!(!collection_offer::exists_at(collection_offer), 0);
     }
@@ -582,10 +710,10 @@ module collection_offer_tests {
         purchaser: &signer,
     ) {
         test_utils::setup(aptos_framework, marketplace, seller, purchaser);
-        let token = test_utils::mint_tokenv2(seller);
+        let (collection, token) = test_utils::mint_tokenv2_with_collection(seller);
         let collection_offer = collection_offer::init_for_tokenv2<AptosCoin>(
             purchaser,
-            tokenv2::collection_object(token),
+            collection,
             test_utils::fee_schedule(marketplace),
             500,
             2,
@@ -634,10 +762,10 @@ module collection_offer_tests {
         purchaser: &signer,
     ) {
         test_utils::setup(aptos_framework, marketplace, seller, purchaser);
-        let token = test_utils::mint_tokenv2(seller);
+        let (collection, token) = test_utils::mint_tokenv2_with_collection(seller);
         let collection_offer = collection_offer::init_for_tokenv2<AptosCoin>(
             purchaser,
-            tokenv2::collection_object(token),
+            collection,
             test_utils::fee_schedule(marketplace),
             500,
             2,
@@ -656,10 +784,10 @@ module collection_offer_tests {
         purchaser: &signer,
     ) {
         test_utils::setup(aptos_framework, marketplace, seller, purchaser);
-        let token = test_utils::mint_tokenv2(seller);
+        let (collection, token) = test_utils::mint_tokenv2_with_collection(seller);
         let collection_offer = collection_offer::init_for_tokenv2<AptosCoin>(
             purchaser,
-            tokenv2::collection_object(token),
+            collection,
             test_utils::fee_schedule(marketplace),
             500,
             2,

@@ -11,17 +11,19 @@ use aptos_executor_test_helpers::{
     },
 };
 use aptos_executor_types::BlockExecutorTrait;
-use aptos_state_view::account_with_state_view::AsAccountWithStateView;
 use aptos_storage_interface::state_view::DbStateViewAtVersion;
 use aptos_types::{
     access_path::AccessPath,
     account_config::{aptos_test_root_address, AccountResource, CORE_CODE_ADDRESS},
-    account_view::AccountView,
     block_metadata::BlockMetadata,
-    state_store::state_key::StateKey,
-    test_helpers::transaction_test_helpers::BLOCK_GAS_LIMIT,
-    transaction::{Transaction, WriteSetPayload},
+    on_chain_config::{AptosVersion, OnChainConfig, ValidatorSet},
+    state_store::{state_key::StateKey, MoveResourceExt},
+    test_helpers::transaction_test_helpers::TEST_BLOCK_EXECUTOR_ONCHAIN_CONFIG,
+    transaction::{
+        signature_verified_transaction::into_signature_verified_block, Transaction, WriteSetPayload,
+    },
     trusted_state::TrustedState,
+    validator_config::ValidatorConfig,
     validator_signer::ValidatorSigner,
 };
 use move_core_types::move_resource::MoveStructType;
@@ -31,7 +33,7 @@ fn test_genesis() {
     let path = aptos_temppath::TempPath::new();
     path.create_as_dir().unwrap();
     let genesis = aptos_vm_genesis::test_genesis_transaction();
-    let (_, db, _executor, waypoint) = create_db_and_executor(path.path(), &genesis);
+    let (_, db, _executor, waypoint) = create_db_and_executor(path.path(), &genesis, false);
 
     let trusted_state = TrustedState::from_epoch_waypoint(waypoint);
     let state_proof = db.reader.get_state_proof(trusted_state.version()).unwrap();
@@ -48,12 +50,15 @@ fn test_genesis() {
         .reader
         .get_state_value_with_proof_by_version(&account_resource_path, 0)
         .unwrap();
-    let (txn_info_version, txn_info) = db
+    let latest_version = db.reader.get_latest_version().unwrap();
+    assert_eq!(latest_version, 0);
+    let txn_info = db
         .reader
-        .get_latest_transaction_info_option()
+        .get_transaction_info_iterator(0, 1)
+        .unwrap()
+        .next()
         .unwrap()
         .unwrap();
-    assert_eq!(txn_info_version, 0);
     state_proof
         .verify(
             txn_info.state_checkpoint_hash().unwrap(),
@@ -74,7 +79,7 @@ fn test_reconfiguration() {
     let (genesis, validators) = aptos_vm_genesis::test_genesis_change_set_and_validators(Some(1));
     let genesis_key = &aptos_vm_genesis::GENESIS_KEYPAIR.0;
     let genesis_txn = Transaction::GenesisTransaction(WriteSetPayload::Direct(genesis));
-    let (_, db, executor, _waypoint) = create_db_and_executor(path.path(), &genesis_txn);
+    let (_, db, executor, _waypoint) = create_db_and_executor(path.path(), &genesis_txn, false);
     let parent_block_id = executor.committed_block_id();
     let signer = ValidatorSigner::new(
         validators[0].data.owner_address,
@@ -89,21 +94,15 @@ fn test_reconfiguration() {
         .reader
         .state_view_at_version(Some(current_version))
         .unwrap();
-    let validator_account_state_view = db_state_view.as_account_with_state_view(&validator_account);
-    let aptos_framework_account_state_view =
-        db_state_view.as_account_with_state_view(&CORE_CODE_ADDRESS);
 
     assert_eq!(
-        aptos_framework_account_state_view
-            .get_validator_set()
-            .unwrap()
+        ValidatorSet::fetch_config(&db_state_view)
             .unwrap()
             .payload()
             .next()
             .unwrap()
             .consensus_public_key(),
-        &validator_account_state_view
-            .get_validator_config_resource()
+        &ValidatorConfig::fetch_move_resource(&db_state_view, &validator_account)
             .unwrap()
             .unwrap()
             .consensus_public_key
@@ -128,22 +127,30 @@ fn test_reconfiguration() {
         300000001,
     ));
 
-    // txn3 = set the aptos version
+    // txn3 = set the aptos version for next epoch
     let txn3 = get_test_signed_transaction(
         aptos_test_root_address(),
         /* sequence_number = */ 1,
         genesis_key.clone(),
         genesis_key.public_key(),
-        Some(aptos_stdlib::version_set_version(42)),
+        Some(aptos_stdlib::version_set_for_next_epoch(42)),
     );
 
-    let txn_block = vec![txn1, txn2, txn3];
+    let txn4 = get_test_signed_transaction(
+        aptos_test_root_address(),
+        2,
+        genesis_key.clone(),
+        genesis_key.public_key(),
+        Some(aptos_stdlib::aptos_governance_force_end_epoch_test_only()),
+    );
+
+    let txn_block = into_signature_verified_block(vec![txn1, txn2, txn3, txn4]);
     let block_id = gen_block_id(1);
     let vm_output = executor
         .execute_block(
             (block_id, txn_block.clone()).into(),
             parent_block_id,
-            BLOCK_GAS_LIMIT,
+            TEST_BLOCK_EXECUTOR_ONCHAIN_CONFIG,
         )
         .unwrap();
 
@@ -158,28 +165,22 @@ fn test_reconfiguration() {
         .unwrap();
 
     let state_proof = db.reader.get_state_proof(0).unwrap();
-    let current_version = state_proof.latest_ledger_info().version();
+    let latest_li = state_proof.latest_ledger_info();
+    let current_version = latest_li.version();
 
-    let t3 = db
+    let t4 = db
         .reader
-        .get_account_transaction(aptos_test_root_address(), 1, true, current_version)
+        .get_transaction_by_version(4, current_version, /*fetch_events=*/ true)
         .unwrap();
-    verify_committed_txn_status(t3.as_ref(), &txn_block[2]).unwrap();
+    verify_committed_txn_status(latest_li, &t4, &txn_block[3]).unwrap();
 
     let db_state_view = db
         .reader
         .state_view_at_version(Some(current_version))
         .unwrap();
 
-    let aptos_framework_account_state_view2 =
-        db_state_view.as_account_with_state_view(&CORE_CODE_ADDRESS);
-
     assert_eq!(
-        aptos_framework_account_state_view2
-            .get_version()
-            .unwrap()
-            .unwrap()
-            .major,
+        AptosVersion::fetch_config(&db_state_view).unwrap().major,
         42
     );
 }

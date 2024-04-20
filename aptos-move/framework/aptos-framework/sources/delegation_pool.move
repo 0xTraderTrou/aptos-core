@@ -113,14 +113,19 @@ module aptos_framework::delegation_pool {
     use std::signer;
     use std::vector;
 
+    use aptos_std::math64;
     use aptos_std::pool_u64_unbound::{Self as pool_u64, total_coins};
     use aptos_std::table::{Self, Table};
+    use aptos_std::smart_table::{Self, SmartTable};
 
     use aptos_framework::account;
+    use aptos_framework::aptos_account;
     use aptos_framework::aptos_coin::AptosCoin;
+    use aptos_framework::aptos_governance;
     use aptos_framework::coin;
-    use aptos_framework::event::{Self, EventHandle};
+    use aptos_framework::event::{Self, EventHandle, emit};
     use aptos_framework::stake;
+    use aptos_framework::stake::get_operator;
     use aptos_framework::staking_config;
     use aptos_framework::timestamp;
 
@@ -162,6 +167,54 @@ module aptos_framework::delegation_pool {
     /// Cannot request to withdraw zero stake.
     const EWITHDRAW_ZERO_STAKE: u64 = 11;
 
+    /// Function is deprecated.
+    const EDEPRECATED_FUNCTION: u64 = 12;
+
+    /// The function is disabled or hasn't been enabled.
+    const EDISABLED_FUNCTION: u64 = 13;
+
+    /// Partial governance voting hasn't been enabled on this delegation pool.
+    const EPARTIAL_GOVERNANCE_VOTING_NOT_ENABLED: u64 = 14;
+
+    /// The voter does not have sufficient stake to create a proposal.
+    const EINSUFFICIENT_PROPOSER_STAKE: u64 = 15;
+
+    /// The voter does not have any voting power on this proposal.
+    const ENO_VOTING_POWER: u64 = 16;
+
+    /// The stake pool has already voted on the proposal before enabling partial governance voting on this delegation pool.
+    const EALREADY_VOTED_BEFORE_ENABLE_PARTIAL_VOTING: u64 = 17;
+
+    /// The account is not the operator of the stake pool.
+    const ENOT_OPERATOR: u64 = 18;
+
+    /// Changing beneficiaries for operators is not supported.
+    const EOPERATOR_BENEFICIARY_CHANGE_NOT_SUPPORTED: u64 = 19;
+
+    /// Commission percentage increase is too large.
+    const ETOO_LARGE_COMMISSION_INCREASE: u64 = 20;
+
+    /// Commission percentage change is too late in this lockup period, and should be done at least a quarter (1/4) of the lockup duration before the lockup cycle ends.
+    const ETOO_LATE_COMMISSION_CHANGE: u64 = 21;
+
+    /// Changing operator commission rate in delegation pool is not supported.
+    const ECOMMISSION_RATE_CHANGE_NOT_SUPPORTED: u64 = 22;
+
+    /// Delegators allowlisting is not supported.
+    const EDELEGATORS_ALLOWLISTING_NOT_SUPPORTED: u64 = 23;
+
+    /// Delegators allowlisting should be enabled to perform this operation.
+    const EDELEGATORS_ALLOWLISTING_NOT_ENABLED: u64 = 24;
+
+    /// Cannot add/reactivate stake unless being allowlisted by the pool owner.
+    const EDELEGATOR_NOT_ALLOWLISTED: u64 = 25;
+
+    /// Cannot evict an allowlisted delegator, should remove them from the allowlist first.
+    const ECANNOT_EVICT_ALLOWLISTED_DELEGATOR: u64 = 26;
+
+    /// Cannot unlock the accumulated active stake of NULL_SHAREHOLDER(0x0).
+    const ECANNOT_UNLOCK_NULL_SHAREHOLDER: u64 = 27;
+
     const MAX_U64: u64 = 18446744073709551615;
 
     /// Maximum operator percentage fee(of double digit precision): 22.85% is represented as 2285
@@ -177,7 +230,7 @@ module aptos_framework::delegation_pool {
     /// Minimum coins to exist on a shares pool at all times.
     /// Enforced per delegator for both active and pending_inactive pools.
     /// This constraint ensures the share price cannot overly increase and lead to
-    /// substantial loses when buying shares (can lose at most 1 share which may
+    /// substantial losses when buying shares (can lose at most 1 share which may
     /// be worth a lot if current share price is high).
     /// This constraint is not enforced on inactive pools as they only allow redeems
     /// (can lose at most 1 coin regardless of current share price).
@@ -185,6 +238,9 @@ module aptos_framework::delegation_pool {
 
     /// Scaling factor of shares pools used within the delegation pool
     const SHARES_SCALING_FACTOR: u64 = 10000000000000000;
+
+    /// Maximum commission percentage increase per lockup cycle. 10% is represented as 1000.
+    const MAX_COMMISSION_INCREASE: u64 = 1000;
 
     /// Capability that represents ownership over privileged operations on the underlying stake pool.
     struct DelegationPoolOwnership has key, store {
@@ -221,6 +277,75 @@ module aptos_framework::delegation_pool {
         distribute_commission_events: EventHandle<DistributeCommissionEvent>,
     }
 
+    struct VotingRecordKey has copy, drop, store {
+        voter: address,
+        proposal_id: u64,
+    }
+
+    /// Track delegated voter of each delegator.
+    struct VoteDelegation has copy, drop, store {
+        // The account who can vote on behalf of this delegator.
+        voter: address,
+        // The account that will become the voter in the next lockup period. Changing voter address needs 1 lockup
+        // period to take effects.
+        pending_voter: address,
+        // Tracks the last known lockup cycle end when the voter was updated. This will be used to determine when
+        // the new voter becomes effective.
+        // If <locked_until_secs of the stake pool> != last_locked_until_secs, it means that a lockup period has passed.
+        // This is slightly different from ObservedLockupCycle because ObservedLockupCycle cannot detect if a lockup
+        // period is passed when there is no unlocking during the lockup period.
+        last_locked_until_secs: u64,
+    }
+
+    /// Track total voting power of each voter.
+    struct DelegatedVotes has copy, drop, store {
+        // The total number of active shares delegated to this voter by all delegators.
+        active_shares: u128,
+        // The total number of pending inactive shares delegated to this voter by all delegators
+        pending_inactive_shares: u128,
+        // Total active shares delegated to this voter in the next lockup cycle.
+        // `active_shares_next_lockup` might be different `active_shares` when some delegators change their voter.
+        active_shares_next_lockup: u128,
+        // Tracks the last known lockup cycle end when the voter was updated. This will be used to determine when
+        // the new voter becomes effective.
+        // If <locked_until_secs of the stake pool> != last_locked_until_secs, it means that a lockup period has passed.
+        // This is slightly different from ObservedLockupCycle because ObservedLockupCycle cannot detect if a lockup
+        // period is passed when there is no unlocking during the lockup period.
+        last_locked_until_secs: u64,
+    }
+
+    /// Track governance information of a delegation(e.g. voter delegation/voting power calculation).
+    /// This struct should be stored in the delegation pool resource account.
+    struct GovernanceRecords has key {
+        // `votes` tracks voting power usage of each voter on each proposal.
+        votes: SmartTable<VotingRecordKey, u64>,
+        // `votes_per_proposal` tracks voting power usage of this stake pool on each proposal. Key is proposal_id.
+        votes_per_proposal: SmartTable<u64, u64>,
+        vote_delegation: SmartTable<address, VoteDelegation>,
+        delegated_votes: SmartTable<address, DelegatedVotes>,
+        vote_events: EventHandle<VoteEvent>,
+        create_proposal_events: EventHandle<CreateProposalEvent>,
+        // Note: a DelegateVotingPowerEvent event only means that the delegator tries to change its voter. The change
+        // won't take effect until the next lockup period.
+        delegate_voting_power_events: EventHandle<DelegateVotingPowerEvent>,
+    }
+
+    struct BeneficiaryForOperator has key {
+        beneficiary_for_operator: address,
+    }
+
+    struct NextCommissionPercentage has key {
+        commission_percentage_next_lockup_cycle: u64,
+        effective_after_secs: u64,
+    }
+
+    /// Tracks a delegation pool's allowlist of delegators.
+    /// If allowlisting is enabled, existing delegators are not implicitly allowlisted and they can be individually
+    /// evicted later by the pool owner.
+    struct DelegationPoolAllowlisting has key {
+        allowlist: SmartTable<address, bool>,
+    }
+
     struct AddStakeEvent has drop, store {
         pool_address: address,
         delegator_address: address,
@@ -253,6 +378,77 @@ module aptos_framework::delegation_pool {
         commission_pending_inactive: u64,
     }
 
+    #[event]
+    struct DistributeCommission has drop, store {
+        pool_address: address,
+        operator: address,
+        beneficiary: address,
+        commission_active: u64,
+        commission_pending_inactive: u64,
+    }
+
+    struct VoteEvent has drop, store {
+        voter: address,
+        proposal_id: u64,
+        delegation_pool: address,
+        num_votes: u64,
+        should_pass: bool,
+    }
+
+    struct CreateProposalEvent has drop, store {
+        proposal_id: u64,
+        voter: address,
+        delegation_pool: address,
+    }
+
+    struct DelegateVotingPowerEvent has drop, store {
+        pool_address: address,
+        delegator: address,
+        voter: address,
+    }
+
+    #[event]
+    struct SetBeneficiaryForOperator has drop, store {
+        operator: address,
+        old_beneficiary: address,
+        new_beneficiary: address,
+    }
+
+    #[event]
+    struct CommissionPercentageChange has drop, store {
+        pool_address: address,
+        owner: address,
+        commission_percentage_next_lockup_cycle: u64,
+    }
+
+    #[event]
+    struct EnableDelegatorsAllowlisting has drop, store {
+        pool_address: address,
+    }
+
+    #[event]
+    struct DisableDelegatorsAllowlisting has drop, store {
+        pool_address: address,
+    }
+
+    #[event]
+    struct AllowlistDelegator has drop, store {
+        pool_address: address,
+        delegator_address: address,
+    }
+
+    #[event]
+    struct RemoveDelegatorFromAllowlist has drop, store {
+        pool_address: address,
+        delegator_address: address,
+    }
+
+    #[event]
+    struct EvictDelegator has drop, store {
+        pool_address: address,
+        delegator_address: address,
+    }
+
     #[view]
     /// Return whether supplied address `addr` is owner of a delegation pool.
     public fun owner_cap_exists(addr: address): bool {
@@ -273,6 +469,12 @@ module aptos_framework::delegation_pool {
     }
 
     #[view]
+    /// Return whether a delegation pool has already enabled partial governance voting.
+    public fun partial_governance_voting_enabled(pool_address: address): bool {
+        exists<GovernanceRecords>(pool_address) && stake::get_delegated_voter(pool_address) == pool_address
+    }
+
+    #[view]
     /// Return the index of current observed lockup cycle on delegation pool `pool_address`.
     public fun observed_lockup_cycle(pool_address: address): u64 acquires DelegationPool {
         assert_delegation_pool_exists(pool_address);
@@ -280,10 +482,32 @@ module aptos_framework::delegation_pool {
     }
 
     #[view]
+    /// Return whether the commission percentage for the next lockup cycle is effective.
+    public fun is_next_commission_percentage_effective(pool_address: address): bool acquires NextCommissionPercentage {
+        exists<NextCommissionPercentage>(pool_address) &&
+            timestamp::now_seconds() >= borrow_global<NextCommissionPercentage>(pool_address).effective_after_secs
+    }
+
+    #[view]
     /// Return the operator commission percentage set on the delegation pool `pool_address`.
-    public fun operator_commission_percentage(pool_address: address): u64 acquires DelegationPool {
+    public fun operator_commission_percentage(pool_address: address): u64 acquires DelegationPool, NextCommissionPercentage {
         assert_delegation_pool_exists(pool_address);
-        borrow_global<DelegationPool>(pool_address).operator_commission_percentage
+        if (is_next_commission_percentage_effective(pool_address)) {
+            operator_commission_percentage_next_lockup_cycle(pool_address)
+        } else {
+            borrow_global<DelegationPool>(pool_address).operator_commission_percentage
+        }
+    }
+
+    #[view]
+    /// Return the operator commission percentage for the next lockup cycle.
+    public fun operator_commission_percentage_next_lockup_cycle(pool_address: address): u64 acquires DelegationPool, NextCommissionPercentage {
+        assert_delegation_pool_exists(pool_address);
+        if (exists<NextCommissionPercentage>(pool_address)) {
+            borrow_global<NextCommissionPercentage>(pool_address).commission_percentage_next_lockup_cycle
+        } else {
+            borrow_global<DelegationPool>(pool_address).operator_commission_percentage
+        }
     }
 
     #[view]
@@ -344,7 +568,7 @@ module aptos_framework::delegation_pool {
     #[view]
     /// Return total stake owned by `delegator_address` within delegation pool `pool_address`
     /// in each of its individual states: (`active`,`inactive`,`pending_inactive`)
-    public fun get_stake(pool_address: address, delegator_address: address): (u64, u64, u64) acquires DelegationPool {
+    public fun get_stake(pool_address: address, delegator_address: address): (u64, u64, u64) acquires DelegationPool, BeneficiaryForOperator {
         assert_delegation_pool_exists(pool_address);
         let pool = borrow_global<DelegationPool>(pool_address);
         let (
@@ -384,7 +608,7 @@ module aptos_framework::delegation_pool {
         // operator rewards are actually used to buy shares which is introducing
         // some imprecision (received stake would be slightly less)
         // but adding rewards onto the existing stake is still a good approximation
-        if (delegator_address == stake::get_operator(pool_address)) {
+        if (delegator_address == beneficiary_for_operator(get_operator(pool_address))) {
             active = active + commission_active;
             // in-flight pending_inactive commission can coexist with already inactive withdrawal
             if (lockup_cycle_ended) {
@@ -406,14 +630,13 @@ module aptos_framework::delegation_pool {
     /// To mitigate this, some of the added stake is extracted and fed back into the pool as placeholder
     /// for the rewards the remaining stake would have earned if active:
     /// extracted-fee = (amount - extracted-fee) * reward-rate% * (100% - operator-commission%)
-    public fun get_add_stake_fee(pool_address: address, amount: u64): u64 acquires DelegationPool {
+    public fun get_add_stake_fee(pool_address: address, amount: u64): u64 acquires DelegationPool, NextCommissionPercentage {
         if (stake::is_current_epoch_validator(pool_address)) {
             let (rewards_rate, rewards_rate_denominator) = staking_config::get_reward_rate(&staking_config::get());
             if (rewards_rate_denominator > 0) {
                 assert_delegation_pool_exists(pool_address);
-                let pool = borrow_global<DelegationPool>(pool_address);
 
-                rewards_rate = rewards_rate * (MAX_FEE - pool.operator_commission_percentage);
+                rewards_rate = rewards_rate * (MAX_FEE - operator_commission_percentage(pool_address));
                 rewards_rate_denominator = rewards_rate_denominator * MAX_FEE;
                 ((((amount as u128) * (rewards_rate as u128)) / ((rewards_rate as u128) + (rewards_rate_denominator as u128))) as u64)
             } else { 0 }
@@ -429,6 +652,97 @@ module aptos_framework::delegation_pool {
             timestamp::now_seconds() >= stake::get_lockup_secs(pool_address)
     }
 
+    #[view]
+    /// Return the total voting power of a delegator in a delegation pool. This function syncs DelegationPool to the
+    /// latest state.
+    public fun calculate_and_update_voter_total_voting_power(pool_address: address, voter: address): u64 acquires DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
+        assert_partial_governance_voting_enabled(pool_address);
+        // Delegation pool need to be synced to explain rewards(which could change the coin amount) and
+        // commission(which could cause share transfer).
+        synchronize_delegation_pool(pool_address);
+        let pool = borrow_global<DelegationPool>(pool_address);
+        let governance_records = borrow_global_mut<GovernanceRecords>(pool_address);
+        let latest_delegated_votes = update_and_borrow_mut_delegated_votes(pool, governance_records, voter);
+        calculate_total_voting_power(pool, latest_delegated_votes)
+    }
+
+    #[view]
+    /// Return the remaining voting power of a delegator in a delegation pool on a proposal. This function syncs DelegationPool to the
+    /// latest state.
+    public fun calculate_and_update_remaining_voting_power(pool_address: address, voter_address: address, proposal_id: u64): u64 acquires DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
+        assert_partial_governance_voting_enabled(pool_address);
+        // If the whole stake pool has no voting power(e.g. it has already voted before partial
+        // governance voting flag is enabled), the delegator also has no voting power.
+        if (aptos_governance::get_remaining_voting_power(pool_address, proposal_id) == 0) {
+            return 0
+        };
+
+        let total_voting_power = calculate_and_update_voter_total_voting_power(pool_address, voter_address);
+        let governance_records = borrow_global<GovernanceRecords>(pool_address);
+        total_voting_power - get_used_voting_power(governance_records, voter_address, proposal_id)
+    }
+
+    #[view]
+    /// Return the latest delegated voter of a delegator in a delegation pool. This function syncs DelegationPool to the
+    /// latest state.
+    public fun calculate_and_update_delegator_voter(pool_address: address, delegator_address: address): address acquires DelegationPool, GovernanceRecords {
+        assert_partial_governance_voting_enabled(pool_address);
+        calculate_and_update_delegator_voter_internal(
+            borrow_global<DelegationPool>(pool_address),
+            borrow_global_mut<GovernanceRecords>(pool_address),
+            delegator_address
+        )
+    }
+
+    #[view]
+    /// Return the address of the stake pool to be created with the provided owner, and seed.
+    public fun get_expected_stake_pool_address(owner: address, delegation_pool_creation_seed: vector<u8>
+    ): address {
+        let seed = create_resource_account_seed(delegation_pool_creation_seed);
+        account::create_resource_address(&owner, seed)
+    }
+
+    #[view]
+    /// Return the minimum remaining time in seconds for commission change, which is one fourth of the lockup duration.
+    public fun min_remaining_secs_for_commission_change(): u64 {
+        let config = staking_config::get();
+        staking_config::get_recurring_lockup_duration(&config) / 4
+    }
+
+    #[view]
+    /// Return whether allowlisting is enabled for the provided delegation pool.
+    public fun allowlisting_enabled(pool_address: address): bool {
+        assert_delegation_pool_exists(pool_address);
+        exists<DelegationPoolAllowlisting>(pool_address)
+    }
+
+    #[view]
+    /// Return whether the provided delegator is allowlisted.
+    /// A delegator is allowlisted if:
+    /// - allowlisting is disabled on the pool
+    /// - delegator is part of the allowlist
+    public fun delegator_allowlisted(
+        pool_address: address,
+        delegator_address: address,
+    ): bool acquires DelegationPoolAllowlisting {
+        if (!allowlisting_enabled(pool_address)) { return true };
+        smart_table::contains(freeze(borrow_mut_delegators_allowlist(pool_address)), delegator_address)
+    }
+
+    #[view]
+    /// Return allowlist or revert if allowlisting is not enabled for the provided delegation pool.
+    public fun get_delegators_allowlist(
+        pool_address: address,
+    ): vector<address> acquires DelegationPoolAllowlisting {
+        assert_allowlisting_enabled(pool_address);
+
+        let allowlist = vector[];
+        smart_table::for_each_ref(freeze(borrow_mut_delegators_allowlist(pool_address)), |delegator, _v| {
+            vector::push_back(&mut allowlist, *delegator);
+        });
+        allowlist
+    }
+
     /// Initialize a delegation pool of custom fixed `operator_commission_percentage`.
     /// A resource account is created from `owner` signer and its supplied `delegation_pool_creation_seed`
     /// to host the delegation pool resource and own the underlying stake pool.
@@ -437,18 +751,14 @@ module aptos_framework::delegation_pool {
         owner: &signer,
         operator_commission_percentage: u64,
         delegation_pool_creation_seed: vector<u8>,
-    ) {
+    ) acquires DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
         assert!(features::delegation_pools_enabled(), error::invalid_state(EDELEGATION_POOLS_DISABLED));
         let owner_address = signer::address_of(owner);
         assert!(!owner_cap_exists(owner_address), error::already_exists(EOWNER_CAP_ALREADY_EXISTS));
         assert!(operator_commission_percentage <= MAX_FEE, error::invalid_argument(EINVALID_COMMISSION_PERCENTAGE));
 
         // generate a seed to be used to create the resource account hosting the delegation pool
-        let seed = vector::empty<u8>();
-        // include module salt (before any subseeds) to avoid conflicts with other modules creating resource accounts
-        vector::append(&mut seed, MODULE_SALT);
-        // include an additional salt in case the same resource account has already been created
-        vector::append(&mut seed, delegation_pool_creation_seed);
+        let seed = create_resource_account_seed(delegation_pool_creation_seed);
 
         let (stake_pool_signer, stake_pool_signer_cap) = account::create_resource_account(owner, seed);
         coin::register<AptosCoin>(&stake_pool_signer);
@@ -481,6 +791,131 @@ module aptos_framework::delegation_pool {
 
         // save delegation pool ownership and resource account address (inner stake pool address) on `owner`
         move_to(owner, DelegationPoolOwnership { pool_address });
+
+        // All delegation pool enable partial governance voting by default once the feature flag is enabled.
+        if (features::partial_governance_voting_enabled() && features::delegation_pool_partial_governance_voting_enabled()) {
+            enable_partial_governance_voting(pool_address);
+        }
+    }
+
+    #[view]
+    /// Return the beneficiary address of the operator.
+    public fun beneficiary_for_operator(operator: address): address acquires BeneficiaryForOperator {
+        if (exists<BeneficiaryForOperator>(operator)) {
+            return borrow_global<BeneficiaryForOperator>(operator).beneficiary_for_operator
+        } else {
+            operator
+        }
+    }
+
+    /// Enable partial governance voting on a stake pool. The voter of this stake pool will be managed by this module.
+    /// The existing voter will be replaced. The function is permissionless.
+    public entry fun enable_partial_governance_voting(
+        pool_address: address,
+    ) acquires DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
+        assert!(features::partial_governance_voting_enabled(), error::invalid_state(EDISABLED_FUNCTION));
+        assert!(features::delegation_pool_partial_governance_voting_enabled(), error::invalid_state(EDISABLED_FUNCTION));
+        assert_delegation_pool_exists(pool_address);
+        // synchronize delegation and stake pools before any user operation.
+        synchronize_delegation_pool(pool_address);
+
+        let delegation_pool = borrow_global<DelegationPool>(pool_address);
+        let stake_pool_signer = retrieve_stake_pool_owner(delegation_pool);
+        // delegated_voter is managed by the stake pool itself, which signer capability is managed by DelegationPool.
+        // So voting power of this stake pool can only be used through this module.
+        stake::set_delegated_voter(&stake_pool_signer, signer::address_of(&stake_pool_signer));
+
+        move_to(&stake_pool_signer, GovernanceRecords {
+            votes: smart_table::new(),
+            votes_per_proposal: smart_table::new(),
+            vote_delegation: smart_table::new(),
+            delegated_votes: smart_table::new(),
+            vote_events: account::new_event_handle<VoteEvent>(&stake_pool_signer),
+            create_proposal_events: account::new_event_handle<CreateProposalEvent>(&stake_pool_signer),
+            delegate_voting_power_events: account::new_event_handle<DelegateVotingPowerEvent>(&stake_pool_signer),
+        });
+    }
+
+    /// Vote on a proposal with a voter's voting power. To successfully vote, the following conditions must be met:
+    /// 1. The voting period of the proposal hasn't ended.
+    /// 2. The delegation pool's lockup period ends after the voting period of the proposal.
+    /// 3. The voter still has spare voting power on this proposal.
+    /// 4. The delegation pool never votes on the proposal before enabling partial governance voting.
+    public entry fun vote(voter: &signer, pool_address: address, proposal_id: u64, voting_power: u64, should_pass: bool) acquires DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
+        assert_partial_governance_voting_enabled(pool_address);
+        // synchronize delegation and stake pools before any user operation.
+        synchronize_delegation_pool(pool_address);
+
+        let voter_address = signer::address_of(voter);
+        let remaining_voting_power = calculate_and_update_remaining_voting_power(pool_address, voter_address, proposal_id);
+        if (voting_power > remaining_voting_power) {
+            voting_power = remaining_voting_power;
+        };
+        assert!(voting_power > 0, error::invalid_argument(ENO_VOTING_POWER));
+
+        let governance_records = borrow_global_mut<GovernanceRecords>(pool_address);
+        // Check a edge case during the transient period of enabling partial governance voting.
+        assert_and_update_proposal_used_voting_power(governance_records, pool_address, proposal_id, voting_power);
+        let used_voting_power = borrow_mut_used_voting_power(governance_records, voter_address, proposal_id);
+        *used_voting_power = *used_voting_power + voting_power;
+
+        let pool_signer = retrieve_stake_pool_owner(borrow_global<DelegationPool>(pool_address));
+        aptos_governance::partial_vote(&pool_signer, pool_address, proposal_id, voting_power, should_pass);
+
+        event::emit_event(
+            &mut governance_records.vote_events,
+            VoteEvent {
+                voter: voter_address,
+                proposal_id,
+                delegation_pool: pool_address,
+                num_votes: voting_power,
+                should_pass,
+            }
+        );
+    }
+
+    /// A voter could create a governance proposal by this function. To successfully create a proposal, the voter's
+    /// voting power in THIS delegation pool must be not less than the minimum required voting power specified in
+    /// `aptos_governance.move`.
+    public entry fun create_proposal(
+        voter: &signer,
+        pool_address: address,
+        execution_hash: vector<u8>,
+        metadata_location: vector<u8>,
+        metadata_hash: vector<u8>,
+        is_multi_step_proposal: bool,
+    ) acquires DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
+        assert_partial_governance_voting_enabled(pool_address);
+
+        // synchronize delegation and stake pools before any user operation
+        synchronize_delegation_pool(pool_address);
+
+        let voter_addr = signer::address_of(voter);
+        let pool = borrow_global<DelegationPool>(pool_address);
+        let governance_records = borrow_global_mut<GovernanceRecords>(pool_address);
+        let total_voting_power = calculate_and_update_delegated_votes(pool, governance_records, voter_addr);
+        assert!(
+            total_voting_power >= aptos_governance::get_required_proposer_stake(),
+            error::invalid_argument(EINSUFFICIENT_PROPOSER_STAKE));
+        let pool_signer = retrieve_stake_pool_owner(borrow_global<DelegationPool>(pool_address));
+        let proposal_id = aptos_governance::create_proposal_v2_impl(
+            &pool_signer,
+            pool_address,
+            execution_hash,
+            metadata_location,
+            metadata_hash,
+            is_multi_step_proposal,
+        );
+
+        let governance_records = borrow_global_mut<GovernanceRecords>(pool_address);
+        event::emit_event(
+            &mut governance_records.create_proposal_events,
+            CreateProposalEvent {
+                proposal_id,
+                voter: voter_addr,
+                delegation_pool: pool_address,
+            }
+        );
     }
 
     fun assert_owner_cap_exists(owner: address) {
@@ -501,6 +936,25 @@ module aptos_framework::delegation_pool {
         assert!(
             balance >= MIN_COINS_ON_SHARES_POOL,
             error::invalid_argument(EDELEGATOR_PENDING_INACTIVE_BALANCE_TOO_LOW)
+        );
+    }
+
+    fun assert_partial_governance_voting_enabled(pool_address: address) {
+        assert_delegation_pool_exists(pool_address);
+        assert!(partial_governance_voting_enabled(pool_address), error::invalid_state(EPARTIAL_GOVERNANCE_VOTING_NOT_ENABLED));
+    }
+
+    fun assert_allowlisting_enabled(pool_address: address) {
+        assert!(allowlisting_enabled(pool_address), error::invalid_state(EDELEGATORS_ALLOWLISTING_NOT_ENABLED));
+    }
+
+    fun assert_delegator_allowlisted(
+        pool_address: address,
+        delegator_address: address,
+    ) acquires DelegationPoolAllowlisting {
+        assert!(
+            delegator_allowlisted(pool_address, delegator_address),
+            error::permission_denied(EDELEGATOR_NOT_ALLOWLISTED)
         );
     }
 
@@ -554,15 +1008,149 @@ module aptos_framework::delegation_pool {
         account::get_signer_capability_address(&pool.stake_pool_signer_cap)
     }
 
+    /// Get the active share amount of the delegator.
+    fun get_delegator_active_shares(pool: &DelegationPool, delegator: address): u128 {
+        pool_u64::shares(&pool.active_shares, delegator)
+    }
+
+    /// Get the pending inactive share amount of the delegator.
+    fun get_delegator_pending_inactive_shares(pool: &DelegationPool, delegator: address): u128 {
+        pool_u64::shares(pending_inactive_shares_pool(pool), delegator)
+    }
+
+    /// Get the used voting power of a voter on a proposal.
+    fun get_used_voting_power(governance_records: &GovernanceRecords, voter: address, proposal_id: u64): u64 {
+        let votes = &governance_records.votes;
+        let key = VotingRecordKey {
+            voter,
+            proposal_id,
+        };
+        *smart_table::borrow_with_default(votes, key, &0)
+    }
+
+    /// Create the seed to derive the resource account address.
+    fun create_resource_account_seed(
+        delegation_pool_creation_seed: vector<u8>,
+    ): vector<u8> {
+        let seed = vector::empty<u8>();
+        // include module salt (before any subseeds) to avoid conflicts with other modules creating resource accounts
+        vector::append(&mut seed, MODULE_SALT);
+        // include an additional salt in case the same resource account has already been created
+        vector::append(&mut seed, delegation_pool_creation_seed);
+        seed
+    }
+
+    /// Borrow the mutable used voting power of a voter on a proposal.
+    inline fun borrow_mut_used_voting_power(governance_records: &mut GovernanceRecords, voter: address, proposal_id: u64): &mut u64 {
+        let votes = &mut governance_records.votes;
+        let key = VotingRecordKey {
+            proposal_id,
+            voter,
+        };
+        smart_table::borrow_mut_with_default(votes, key, 0)
+    }
+
+    /// Update VoteDelegation of a delegator to up-to-date then borrow_mut it.
+    fun update_and_borrow_mut_delegator_vote_delegation(
+        pool: &DelegationPool,
+        governance_records :&mut GovernanceRecords,
+        delegator: address
+    ): &mut VoteDelegation {
+        let pool_address = get_pool_address(pool);
+        let locked_until_secs = stake::get_lockup_secs(pool_address);
+
+        let vote_delegation_table = &mut governance_records.vote_delegation;
+        // By default, a delegator's delegated voter is itself.
+        // TODO: recycle storage when VoteDelegation equals to default value.
+        if (!smart_table::contains(vote_delegation_table, delegator)) {
+            return smart_table::borrow_mut_with_default(vote_delegation_table, delegator, VoteDelegation {
+                voter: delegator,
+                last_locked_until_secs: locked_until_secs,
+                pending_voter: delegator,
+            })
+        };
+
+        let vote_delegation = smart_table::borrow_mut(vote_delegation_table, delegator);
+        // A lockup period has passed since last time `vote_delegation` was updated. Pending voter takes effect.
+        if (vote_delegation.last_locked_until_secs < locked_until_secs &&
+            vote_delegation.voter != vote_delegation.pending_voter) {
+            vote_delegation.voter = vote_delegation.pending_voter;
+        };
+        vote_delegation
+    }
+
+    /// Update DelegatedVotes of a voter to up-to-date then borrow_mut it.
+    fun update_and_borrow_mut_delegated_votes(
+        pool: &DelegationPool,
+        governance_records :&mut GovernanceRecords,
+        voter: address
+    ): &mut DelegatedVotes {
+        let pool_address = get_pool_address(pool);
+        let locked_until_secs = stake::get_lockup_secs(pool_address);
+
+        let delegated_votes_per_voter = &mut governance_records.delegated_votes;
+        // By default, a delegator's voter is itself.
+        // TODO: recycle storage when DelegatedVotes equals to default value.
+        if (!smart_table::contains(delegated_votes_per_voter, voter)) {
+            let active_shares = get_delegator_active_shares(pool, voter);
+            let inactive_shares = get_delegator_pending_inactive_shares(pool, voter);
+            return smart_table::borrow_mut_with_default(delegated_votes_per_voter, voter, DelegatedVotes {
+                active_shares,
+                pending_inactive_shares: inactive_shares,
+                active_shares_next_lockup: active_shares,
+                last_locked_until_secs: locked_until_secs,
+            })
+        };
+
+        let delegated_votes = smart_table::borrow_mut(delegated_votes_per_voter, voter);
+        // A lockup period has passed since last time `delegated_votes` was updated. Pending voter takes effect.
+        if (delegated_votes.last_locked_until_secs < locked_until_secs) {
+            delegated_votes.active_shares = delegated_votes.active_shares_next_lockup;
+            delegated_votes.pending_inactive_shares = 0;
+            delegated_votes.last_locked_until_secs = locked_until_secs;
+        };
+        delegated_votes
+    }
+
     fun olc_with_index(index: u64): ObservedLockupCycle {
         ObservedLockupCycle { index }
+    }
+
+    /// Given the amounts of shares in `active_shares` pool and `inactive_shares` pool, calculate the total voting
+    /// power, which equals to the sum of the coin amounts.
+    fun calculate_total_voting_power(delegation_pool: &DelegationPool, latest_delegated_votes: &DelegatedVotes): u64 {
+        let active_amount = pool_u64::shares_to_amount(
+            &delegation_pool.active_shares,
+            latest_delegated_votes.active_shares);
+        let pending_inactive_amount = pool_u64::shares_to_amount(
+            pending_inactive_shares_pool(delegation_pool),
+            latest_delegated_votes.pending_inactive_shares);
+        active_amount + pending_inactive_amount
+    }
+
+    /// Update VoteDelegation of a delegator to up-to-date then return the latest voter.
+    fun calculate_and_update_delegator_voter_internal(pool: &DelegationPool, governance_records: &mut GovernanceRecords, delegator: address): address {
+        let vote_delegation = update_and_borrow_mut_delegator_vote_delegation(pool, governance_records, delegator);
+        vote_delegation.voter
+    }
+
+    /// Update DelegatedVotes of a voter to up-to-date then return the total voting power of this voter.
+    fun calculate_and_update_delegated_votes(pool: &DelegationPool, governance_records: &mut GovernanceRecords, voter: address): u64 {
+        let delegated_votes = update_and_borrow_mut_delegated_votes(pool, governance_records, voter);
+        calculate_total_voting_power(pool, delegated_votes)
+    }
+
+    inline fun borrow_mut_delegators_allowlist(
+        pool_address: address
+    ): &mut SmartTable<address, bool> acquires DelegationPoolAllowlisting {
+        &mut borrow_global_mut<DelegationPoolAllowlisting>(pool_address).allowlist
     }
 
     /// Allows an owner to change the operator of the underlying stake pool.
     public entry fun set_operator(
         owner: &signer,
         new_operator: address
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
         let pool_address = get_owned_pool_address(signer::address_of(owner));
         // synchronize delegation and stake pools before any user operation
         // ensure the old operator is paid its uncommitted commission rewards
@@ -570,21 +1158,238 @@ module aptos_framework::delegation_pool {
         stake::set_operator(&retrieve_stake_pool_owner(borrow_global<DelegationPool>(pool_address)), new_operator);
     }
 
+    /// Allows an operator to change its beneficiary. Any existing unpaid commission rewards will be paid to the new
+    /// beneficiary. To ensure payment to the current beneficiary, one should first call `synchronize_delegation_pool`
+    /// before switching the beneficiary. An operator can set one beneficiary for delegation pools, not a separate
+    /// one for each pool.
+    public entry fun set_beneficiary_for_operator(operator: &signer, new_beneficiary: address) acquires BeneficiaryForOperator {
+        assert!(features::operator_beneficiary_change_enabled(), std::error::invalid_state(
+            EOPERATOR_BENEFICIARY_CHANGE_NOT_SUPPORTED
+        ));
+        // The beneficiay address of an operator is stored under the operator's address.
+        // So, the operator does not need to be validated with respect to a staking pool.
+        let operator_addr = signer::address_of(operator);
+        let old_beneficiary = beneficiary_for_operator(operator_addr);
+        if (exists<BeneficiaryForOperator>(operator_addr)) {
+            borrow_global_mut<BeneficiaryForOperator>(operator_addr).beneficiary_for_operator = new_beneficiary;
+        } else {
+            move_to(operator, BeneficiaryForOperator { beneficiary_for_operator: new_beneficiary });
+        };
+
+        emit(SetBeneficiaryForOperator {
+            operator: operator_addr,
+            old_beneficiary,
+            new_beneficiary,
+        });
+    }
+
+    /// Allows an owner to update the commission percentage for the operator of the underlying stake pool.
+    public entry fun update_commission_percentage(
+        owner: &signer,
+        new_commission_percentage: u64
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
+        assert!(features::commission_change_delegation_pool_enabled(), error::invalid_state(
+            ECOMMISSION_RATE_CHANGE_NOT_SUPPORTED
+        ));
+        assert!(new_commission_percentage <= MAX_FEE, error::invalid_argument(EINVALID_COMMISSION_PERCENTAGE));
+        let owner_address = signer::address_of(owner);
+        let pool_address = get_owned_pool_address(owner_address);
+        assert!(
+            operator_commission_percentage(pool_address) + MAX_COMMISSION_INCREASE >= new_commission_percentage,
+            error::invalid_argument(ETOO_LARGE_COMMISSION_INCREASE)
+        );
+        assert!(
+            stake::get_remaining_lockup_secs(pool_address) >= min_remaining_secs_for_commission_change(),
+            error::invalid_state(ETOO_LATE_COMMISSION_CHANGE)
+        );
+
+        // synchronize delegation and stake pools before any user operation. this ensures:
+        // (1) the operator is paid its uncommitted commission rewards with the old commission percentage, and
+        // (2) any pending commission percentage change is applied before the new commission percentage is set.
+        synchronize_delegation_pool(pool_address);
+
+        if (exists<NextCommissionPercentage>(pool_address)) {
+            let commission_percentage = borrow_global_mut<NextCommissionPercentage>(pool_address);
+            commission_percentage.commission_percentage_next_lockup_cycle = new_commission_percentage;
+            commission_percentage.effective_after_secs = stake::get_lockup_secs(pool_address);
+        } else {
+            let delegation_pool = borrow_global<DelegationPool>(pool_address);
+            let pool_signer = account::create_signer_with_capability(&delegation_pool.stake_pool_signer_cap);
+            move_to(&pool_signer, NextCommissionPercentage {
+                commission_percentage_next_lockup_cycle: new_commission_percentage,
+                effective_after_secs: stake::get_lockup_secs(pool_address),
+            });
+        };
+
+        event::emit(CommissionPercentageChange {
+            pool_address,
+            owner: owner_address,
+            commission_percentage_next_lockup_cycle: new_commission_percentage,
+        });
+    }
+
     /// Allows an owner to change the delegated voter of the underlying stake pool.
     public entry fun set_delegated_voter(
         owner: &signer,
         new_voter: address
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
+        // No one can change delegated_voter once the partial governance voting feature is enabled.
+        assert!(!features::delegation_pool_partial_governance_voting_enabled(), error::invalid_state(EDEPRECATED_FUNCTION));
         let pool_address = get_owned_pool_address(signer::address_of(owner));
         // synchronize delegation and stake pools before any user operation
         synchronize_delegation_pool(pool_address);
         stake::set_delegated_voter(&retrieve_stake_pool_owner(borrow_global<DelegationPool>(pool_address)), new_voter);
     }
 
+    /// Allows a delegator to delegate its voting power to a voter. If this delegator already has a delegated voter,
+    /// this change won't take effects until the next lockup period.
+    public entry fun delegate_voting_power(
+        delegator: &signer,
+        pool_address: address,
+        new_voter: address
+    ) acquires DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
+        assert_partial_governance_voting_enabled(pool_address);
+
+        // synchronize delegation and stake pools before any user operation
+        synchronize_delegation_pool(pool_address);
+
+        let delegator_address = signer::address_of(delegator);
+        let delegation_pool = borrow_global<DelegationPool>(pool_address);
+        let governance_records = borrow_global_mut<GovernanceRecords>(pool_address);
+        let delegator_vote_delegation = update_and_borrow_mut_delegator_vote_delegation(
+                delegation_pool,
+                governance_records,
+                delegator_address
+            );
+        let pending_voter: address = delegator_vote_delegation.pending_voter;
+
+        // No need to update if the voter doesn't really change.
+        if (pending_voter != new_voter) {
+            delegator_vote_delegation.pending_voter = new_voter;
+            let active_shares = get_delegator_active_shares(delegation_pool, delegator_address);
+            // <active shares> of <pending voter of shareholder> -= <active_shares>
+            // <active shares> of <new voter of shareholder> += <active_shares>
+            let pending_delegated_votes = update_and_borrow_mut_delegated_votes(
+                delegation_pool,
+                governance_records,
+                pending_voter
+            );
+            pending_delegated_votes.active_shares_next_lockup =
+                pending_delegated_votes.active_shares_next_lockup - active_shares;
+
+            let new_delegated_votes = update_and_borrow_mut_delegated_votes(
+                delegation_pool,
+                governance_records,
+                new_voter
+            );
+            new_delegated_votes.active_shares_next_lockup =
+                new_delegated_votes.active_shares_next_lockup + active_shares;
+        };
+
+        event::emit_event(&mut governance_records.delegate_voting_power_events, DelegateVotingPowerEvent {
+            pool_address,
+            delegator: delegator_address,
+            voter: new_voter,
+        });
+    }
+
+    /// Enable delegators allowlisting as the pool owner.
+    public entry fun enable_delegators_allowlisting(
+        owner: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool {
+        assert!(
+            features::delegation_pool_allowlisting_enabled(),
+            error::invalid_state(EDELEGATORS_ALLOWLISTING_NOT_SUPPORTED)
+        );
+
+        let pool_address = get_owned_pool_address(signer::address_of(owner));
+        if (allowlisting_enabled(pool_address)) { return };
+
+        let pool_signer = retrieve_stake_pool_owner(borrow_global<DelegationPool>(pool_address));
+        move_to(&pool_signer, DelegationPoolAllowlisting { allowlist: smart_table::new<address, bool>() });
+
+        event::emit(EnableDelegatorsAllowlisting { pool_address });
+    }
+
+    /// Disable delegators allowlisting as the pool owner. The existing allowlist will be emptied.
+    public entry fun disable_delegators_allowlisting(
+        owner: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPoolAllowlisting {
+        let pool_address = get_owned_pool_address(signer::address_of(owner));
+        assert_allowlisting_enabled(pool_address);
+
+        let DelegationPoolAllowlisting { allowlist } = move_from<DelegationPoolAllowlisting>(pool_address);
+        // if the allowlist becomes too large, the owner can always remove some delegators
+        smart_table::destroy(allowlist);
+
+        event::emit(DisableDelegatorsAllowlisting { pool_address });
+    }
+
+    /// Allowlist a delegator as the pool owner.
+    public entry fun allowlist_delegator(
+        owner: &signer,
+        delegator_address: address,
+    ) acquires DelegationPoolOwnership, DelegationPoolAllowlisting {
+        let pool_address = get_owned_pool_address(signer::address_of(owner));
+        assert_allowlisting_enabled(pool_address);
+
+        if (delegator_allowlisted(pool_address, delegator_address)) { return };
+
+        smart_table::add(borrow_mut_delegators_allowlist(pool_address), delegator_address, true);
+
+        event::emit(AllowlistDelegator { pool_address, delegator_address });
+    }
+
+    /// Remove a delegator from the allowlist as the pool owner, but do not unlock their stake.
+    public entry fun remove_delegator_from_allowlist(
+        owner: &signer,
+        delegator_address: address,
+    ) acquires DelegationPoolOwnership, DelegationPoolAllowlisting {
+        let pool_address = get_owned_pool_address(signer::address_of(owner));
+        assert_allowlisting_enabled(pool_address);
+
+        if (!delegator_allowlisted(pool_address, delegator_address)) { return };
+
+        smart_table::remove(borrow_mut_delegators_allowlist(pool_address), delegator_address);
+
+        event::emit(RemoveDelegatorFromAllowlist { pool_address, delegator_address });
+    }
+
+    /// Evict a delegator that is not allowlisted by unlocking their entire stake.
+    public entry fun evict_delegator(
+        owner: &signer,
+        delegator_address: address,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        let pool_address = get_owned_pool_address(signer::address_of(owner));
+        assert_allowlisting_enabled(pool_address);
+        assert!(
+            !delegator_allowlisted(pool_address, delegator_address),
+            error::invalid_state(ECANNOT_EVICT_ALLOWLISTED_DELEGATOR)
+        );
+
+        // synchronize pool in order to query latest balance of delegator
+        synchronize_delegation_pool(pool_address);
+
+        let pool = borrow_global<DelegationPool>(pool_address);
+        if (get_delegator_active_shares(pool, delegator_address) == 0) { return };
+
+        unlock_internal(delegator_address, pool_address, pool_u64::balance(&pool.active_shares, delegator_address));
+
+        event::emit(EvictDelegator { pool_address, delegator_address });
+    }
+
     /// Add `amount` of coins to the delegation pool `pool_address`.
-    public entry fun add_stake(delegator: &signer, pool_address: address, amount: u64) acquires DelegationPool {
+    public entry fun add_stake(
+        delegator: &signer,
+        pool_address: address,
+        amount: u64
+    ) acquires DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
         // short-circuit if amount to add is 0 so no event is emitted
         if (amount == 0) { return };
+
+        let delegator_address = signer::address_of(delegator);
+        assert_delegator_allowlisted(pool_address, delegator_address);
+
         // synchronize delegation and stake pools before any user operation
         synchronize_delegation_pool(pool_address);
 
@@ -592,21 +1397,20 @@ module aptos_framework::delegation_pool {
         let add_stake_fee = get_add_stake_fee(pool_address, amount);
 
         let pool = borrow_global_mut<DelegationPool>(pool_address);
-        let delegator_address = signer::address_of(delegator);
 
         // stake the entire amount to the stake pool
-        coin::transfer<AptosCoin>(delegator, pool_address, amount);
+        aptos_account::transfer(delegator, pool_address, amount);
         stake::add_stake(&retrieve_stake_pool_owner(pool), amount);
 
         // but buy shares for delegator just for the remaining amount after fee
-        pool_u64::buy_in(&mut pool.active_shares, delegator_address, amount - add_stake_fee);
+        buy_in_active_shares(pool, delegator_address, amount - add_stake_fee);
         assert_min_active_balance(pool, delegator_address);
 
         // grant temporary ownership over `add_stake` fees to a separate shareholder in order to:
         // - not mistake them for rewards to pay the operator from
         // - distribute them together with the `active` rewards when this epoch ends
         // in order to appreciate all shares on the active pool atomically
-        pool_u64::buy_in(&mut pool.active_shares, NULL_SHAREHOLDER, add_stake_fee);
+        buy_in_active_shares(pool, NULL_SHAREHOLDER, add_stake_fee);
 
         event::emit_event(
             &mut pool.add_stake_events,
@@ -621,20 +1425,33 @@ module aptos_framework::delegation_pool {
 
     /// Unlock `amount` from the active + pending_active stake of `delegator` or
     /// at most how much active stake there is on the stake pool.
-    public entry fun unlock(delegator: &signer, pool_address: address, amount: u64) acquires DelegationPool {
+    public entry fun unlock(
+        delegator: &signer,
+        pool_address: address,
+        amount: u64
+    ) acquires DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
         // short-circuit if amount to unlock is 0 so no event is emitted
         if (amount == 0) { return };
+
+        // synchronize delegation and stake pools before any user operation
+        synchronize_delegation_pool(pool_address);
+
+        let delegator_address = signer::address_of(delegator);
+        unlock_internal(delegator_address, pool_address, amount);
+    }
+
+    fun unlock_internal(
+        delegator_address: address,
+        pool_address: address,
+        amount: u64
+    ) acquires DelegationPool, GovernanceRecords {
+        assert!(delegator_address != NULL_SHAREHOLDER, error::invalid_argument(ECANNOT_UNLOCK_NULL_SHAREHOLDER));
 
         // fail unlock of more stake than `active` on the stake pool
         let (active, _, _, _) = stake::get_stake(pool_address);
         assert!(amount <= active, error::invalid_argument(ENOT_ENOUGH_ACTIVE_STAKE_TO_UNLOCK));
 
-        // synchronize delegation and stake pools before any user operation
-        synchronize_delegation_pool(pool_address);
-
         let pool = borrow_global_mut<DelegationPool>(pool_address);
-        let delegator_address = signer::address_of(delegator);
-
         amount = coins_to_transfer_to_ensure_min_stake(
             &pool.active_shares,
             pending_inactive_shares_pool(pool),
@@ -659,15 +1476,21 @@ module aptos_framework::delegation_pool {
     }
 
     /// Move `amount` of coins from pending_inactive to active.
-    public entry fun reactivate_stake(delegator: &signer, pool_address: address, amount: u64) acquires DelegationPool {
+    public entry fun reactivate_stake(
+        delegator: &signer,
+        pool_address: address,
+        amount: u64
+    ) acquires DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
         // short-circuit if amount to reactivate is 0 so no event is emitted
         if (amount == 0) { return };
+
+        let delegator_address = signer::address_of(delegator);
+        assert_delegator_allowlisted(pool_address, delegator_address);
+
         // synchronize delegation and stake pools before any user operation
         synchronize_delegation_pool(pool_address);
 
         let pool = borrow_global_mut<DelegationPool>(pool_address);
-        let delegator_address = signer::address_of(delegator);
-
         amount = coins_to_transfer_to_ensure_min_stake(
             pending_inactive_shares_pool(pool),
             &pool.active_shares,
@@ -679,7 +1502,7 @@ module aptos_framework::delegation_pool {
 
         stake::reactivate_stake(&retrieve_stake_pool_owner(pool), amount);
 
-        pool_u64::buy_in(&mut pool.active_shares, delegator_address, amount);
+        buy_in_active_shares(pool, delegator_address, amount);
         assert_min_active_balance(pool, delegator_address);
 
         event::emit_event(
@@ -693,14 +1516,15 @@ module aptos_framework::delegation_pool {
     }
 
     /// Withdraw `amount` of owned inactive stake from the delegation pool at `pool_address`.
-    public entry fun withdraw(delegator: &signer, pool_address: address, amount: u64) acquires DelegationPool {
+    public entry fun withdraw(delegator: &signer, pool_address: address, amount: u64) acquires DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
         assert!(amount > 0, error::invalid_argument(EWITHDRAW_ZERO_STAKE));
         // synchronize delegation and stake pools before any user operation
         synchronize_delegation_pool(pool_address);
         withdraw_internal(borrow_global_mut<DelegationPool>(pool_address), signer::address_of(delegator), amount);
     }
 
-    fun withdraw_internal(pool: &mut DelegationPool, delegator_address: address, amount: u64) {
+    fun withdraw_internal(pool: &mut DelegationPool, delegator_address: address, amount: u64) acquires GovernanceRecords {
+        // TODO: recycle storage when a delegator fully exits the delegation pool.
         // short-circuit if amount to withdraw is 0 so no event is emitted
         if (amount == 0) { return };
 
@@ -741,7 +1565,7 @@ module aptos_framework::delegation_pool {
             // no excess stake if `stake::withdraw` does not inactivate at all
             stake::withdraw(stake_pool_owner, amount);
         };
-        coin::transfer<AptosCoin>(stake_pool_owner, delegator_address, amount);
+        aptos_account::transfer(stake_pool_owner, delegator_address, amount);
 
         // commit withdrawal of possibly inactive stake to the `total_coins_inactive`
         // known by the delegation pool in order to not mistake it for slashing at next synchronization
@@ -784,11 +1608,32 @@ module aptos_framework::delegation_pool {
     /// if existing and already inactive to allow the creation of a new one.
     /// `pending_inactive` stake would be left untouched even if withdrawable and should
     /// be explicitly withdrawn by delegator
-    fun execute_pending_withdrawal(pool: &mut DelegationPool, delegator_address: address) {
+    fun execute_pending_withdrawal(pool: &mut DelegationPool, delegator_address: address) acquires GovernanceRecords {
         let (withdrawal_exists, withdrawal_olc) = pending_withdrawal_exists(pool, delegator_address);
         if (withdrawal_exists && withdrawal_olc.index < pool.observed_lockup_cycle.index) {
             withdraw_internal(pool, delegator_address, MAX_U64);
         }
+    }
+
+    /// Buy shares into the active pool on behalf of delegator `shareholder` who
+    /// deposited `coins_amount`. This function doesn't make any coin transfer.
+    fun buy_in_active_shares(
+        pool: &mut DelegationPool,
+        shareholder: address,
+        coins_amount: u64,
+    ): u128 acquires GovernanceRecords{
+        let new_shares = pool_u64::amount_to_shares(&pool.active_shares, coins_amount);
+        // No need to buy 0 shares.
+        if (new_shares == 0) { return 0 };
+
+        // Always update governance records before any change to the shares pool.
+        let pool_address = get_pool_address(pool);
+        if (partial_governance_voting_enabled(pool_address)) {
+            update_governance_records_for_buy_in_active_shares(pool, pool_address, new_shares, shareholder);
+        };
+
+        pool_u64::buy_in(&mut pool.active_shares, shareholder, coins_amount);
+        new_shares
     }
 
     /// Buy shares into the pending_inactive pool on behalf of delegator `shareholder` who
@@ -799,11 +1644,19 @@ module aptos_framework::delegation_pool {
         pool: &mut DelegationPool,
         shareholder: address,
         coins_amount: u64,
-    ): u128 {
-        // cannot buy inactive shares, only pending_inactive at current lockup cycle
-        let new_shares = pool_u64::buy_in(pending_inactive_shares_pool_mut(pool), shareholder, coins_amount);
+    ): u128 acquires GovernanceRecords {
+        let new_shares = pool_u64::amount_to_shares(pending_inactive_shares_pool(pool), coins_amount);
         // never create a new pending withdrawal unless delegator owns some pending_inactive shares
         if (new_shares == 0) { return 0 };
+
+        // Always update governance records before any change to the shares pool.
+        let pool_address = get_pool_address(pool);
+        if (partial_governance_voting_enabled(pool_address)) {
+            update_governance_records_for_buy_in_pending_inactive_shares(pool, pool_address, new_shares, shareholder);
+        };
+
+        // cannot buy inactive shares, only pending_inactive at current lockup cycle
+        pool_u64::buy_in(pending_inactive_shares_pool_mut(pool), shareholder, coins_amount);
 
         // execute the pending withdrawal if exists and is inactive before creating a new one
         execute_pending_withdrawal(pool, shareholder);
@@ -844,10 +1697,17 @@ module aptos_framework::delegation_pool {
         pool: &mut DelegationPool,
         shareholder: address,
         coins_amount: u64,
-    ): u64 {
+    ): u64 acquires GovernanceRecords {
         let shares_to_redeem = amount_to_shares_to_redeem(&pool.active_shares, shareholder, coins_amount);
         // silently exit if not a shareholder otherwise redeem would fail with `ESHAREHOLDER_NOT_FOUND`
         if (shares_to_redeem == 0) return 0;
+
+        // Always update governance records before any change to the shares pool.
+        let pool_address = get_pool_address(pool);
+        if (partial_governance_voting_enabled(pool_address)) {
+            update_governanace_records_for_redeem_active_shares(pool, pool_address, shares_to_redeem, shareholder);
+        };
+
         pool_u64::redeem_shares(&mut pool.active_shares, shareholder, shares_to_redeem)
     }
 
@@ -862,11 +1722,22 @@ module aptos_framework::delegation_pool {
         shareholder: address,
         coins_amount: u64,
         lockup_cycle: ObservedLockupCycle,
-    ): u64 {
-        let inactive_shares = table::borrow_mut(&mut pool.inactive_shares, lockup_cycle);
-        let shares_to_redeem = amount_to_shares_to_redeem(inactive_shares, shareholder, coins_amount);
+    ): u64 acquires GovernanceRecords {
+        let shares_to_redeem = amount_to_shares_to_redeem(
+            table::borrow(&pool.inactive_shares, lockup_cycle),
+            shareholder,
+            coins_amount);
         // silently exit if not a shareholder otherwise redeem would fail with `ESHAREHOLDER_NOT_FOUND`
         if (shares_to_redeem == 0) return 0;
+
+        // Always update governance records before any change to the shares pool.
+        let pool_address = get_pool_address(pool);
+        // Only redeem shares from the pending_inactive pool at `lockup_cycle` == current OLC.
+        if (partial_governance_voting_enabled(pool_address) && lockup_cycle.index == pool.observed_lockup_cycle.index) {
+            update_governanace_records_for_redeem_pending_inactive_shares(pool, pool_address, shares_to_redeem, shareholder);
+        };
+
+        let inactive_shares = table::borrow_mut(&mut pool.inactive_shares, lockup_cycle);
         // 1. reaching here means delegator owns inactive/pending_inactive shares at OLC `lockup_cycle`
         let redeemed_coins = pool_u64::redeem_shares(inactive_shares, shareholder, shares_to_redeem);
 
@@ -915,18 +1786,18 @@ module aptos_framework::delegation_pool {
         // unsynced are rewards and slashes routed exclusively to/out the stake pool
 
         // operator `active` rewards not persisted yet to the active shares pool
-        let commission_active = total_coins(&pool.active_shares);
-        commission_active = if (active > commission_active) {
-            multiply_then_divide(active - commission_active, pool.operator_commission_percentage, MAX_FEE)
+        let pool_active = total_coins(&pool.active_shares);
+        let commission_active = if (active > pool_active) {
+            math64::mul_div(active - pool_active, pool.operator_commission_percentage, MAX_FEE)
         } else {
             // handle any slashing applied to `active` stake
             0
         };
         // operator `pending_inactive` rewards not persisted yet to the pending_inactive shares pool
-        let commission_pending_inactive = total_coins(pending_inactive_shares_pool(pool));
-        commission_pending_inactive = if (pending_inactive > commission_pending_inactive) {
-            multiply_then_divide(
-                pending_inactive - commission_pending_inactive,
+        let pool_pending_inactive = total_coins(pending_inactive_shares_pool(pool));
+        let commission_pending_inactive = if (pending_inactive > pool_pending_inactive) {
+            math64::mul_div(
+                pending_inactive - pool_pending_inactive,
                 pool.operator_commission_percentage,
                 MAX_FEE
             )
@@ -940,7 +1811,7 @@ module aptos_framework::delegation_pool {
 
     /// Synchronize delegation and stake pools: distribute yet-undetected rewards to the corresponding internal
     /// shares pools, assign commission to operator and eventually prepare delegation pool for a new lockup cycle.
-    public entry fun synchronize_delegation_pool(pool_address: address) acquires DelegationPool {
+    public entry fun synchronize_delegation_pool(pool_address: address) acquires DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
         assert_delegation_pool_exists(pool_address);
         let pool = borrow_global_mut<DelegationPool>(pool_address);
         let (
@@ -974,9 +1845,9 @@ module aptos_framework::delegation_pool {
         );
 
         // reward operator its commission out of uncommitted active rewards (`add_stake` fees already excluded)
-        pool_u64::buy_in(&mut pool.active_shares, stake::get_operator(pool_address), commission_active);
+        buy_in_active_shares(pool, beneficiary_for_operator(stake::get_operator(pool_address)), commission_active);
         // reward operator its commission out of uncommitted pending_inactive rewards
-        buy_in_pending_inactive_shares(pool, stake::get_operator(pool_address), commission_pending_inactive);
+        buy_in_pending_inactive_shares(pool, beneficiary_for_operator(stake::get_operator(pool_address)), commission_pending_inactive);
 
         event::emit_event(
             &mut pool.distribute_commission_events,
@@ -987,6 +1858,16 @@ module aptos_framework::delegation_pool {
                 commission_pending_inactive,
             },
         );
+
+        if (features::operator_beneficiary_change_enabled()) {
+            emit(DistributeCommission {
+                pool_address,
+                operator: stake::get_operator(pool_address),
+                beneficiary: beneficiary_for_operator(stake::get_operator(pool_address)),
+                commission_active,
+                commission_pending_inactive,
+            })
+        };
 
         // advance lockup cycle on delegation pool if already ended on stake pool (AND stake explicitly inactivated)
         if (lockup_cycle_ended) {
@@ -1002,22 +1883,115 @@ module aptos_framework::delegation_pool {
                 pool.observed_lockup_cycle,
                 pool_u64::create_with_scaling_factor(SHARES_SCALING_FACTOR)
             );
+        };
+
+        if (is_next_commission_percentage_effective(pool_address)) {
+            pool.operator_commission_percentage = borrow_global<NextCommissionPercentage>(pool_address).commission_percentage_next_lockup_cycle;
         }
     }
 
-    public fun multiply_then_divide(x: u64, y: u64, z: u64): u64 {
-        let result = (to_u128(x) * to_u128(y)) / to_u128(z);
-        (result as u64)
+    inline fun assert_and_update_proposal_used_voting_power(
+        governance_records: &mut GovernanceRecords, pool_address : address, proposal_id : u64, voting_power: u64
+    ) {
+        let stake_pool_remaining_voting_power = aptos_governance::get_remaining_voting_power(pool_address, proposal_id);
+        let stake_pool_used_voting_power = aptos_governance::get_voting_power(pool_address) - stake_pool_remaining_voting_power;
+        let proposal_used_voting_power = smart_table::borrow_mut_with_default(&mut governance_records.votes_per_proposal, proposal_id, 0);
+        // A edge case: Before enabling partial governance voting on a delegation pool, the delegation pool has
+        // a voter which can vote with all voting power of this delegation pool. If the voter votes on a proposal after
+        // partial governance voting flag is enabled, the delegation pool doesn't have enough voting power on this
+        // proposal for all the delegators. To be fair, no one can vote on this proposal through this delegation pool.
+        // To detect this case, check if the stake pool had used voting power not through delegation_pool module.
+        assert!(stake_pool_used_voting_power == *proposal_used_voting_power, error::invalid_argument(EALREADY_VOTED_BEFORE_ENABLE_PARTIAL_VOTING));
+        *proposal_used_voting_power = *proposal_used_voting_power + voting_power;
     }
 
-    fun to_u128(num: u64): u128 {
-        (num as u128)
+    fun update_governance_records_for_buy_in_active_shares(
+        pool: &DelegationPool, pool_address: address, new_shares: u128, shareholder: address
+    ) acquires GovernanceRecords{
+        // <active shares> of <shareholder> += <new_shares> ---->
+        // <active shares> of <current voter of shareholder> += <new_shares>
+        // <active shares> of <next voter of shareholder> += <new_shares>
+        let governance_records = borrow_global_mut<GovernanceRecords>(pool_address);
+        let vote_delegation = update_and_borrow_mut_delegator_vote_delegation(pool, governance_records, shareholder);
+        let current_voter = vote_delegation.voter;
+        let pending_voter = vote_delegation.pending_voter;
+        let current_delegated_votes =
+            update_and_borrow_mut_delegated_votes(pool, governance_records, current_voter);
+        current_delegated_votes.active_shares = current_delegated_votes.active_shares + new_shares;
+        if (pending_voter == current_voter) {
+            current_delegated_votes.active_shares_next_lockup =
+                current_delegated_votes.active_shares_next_lockup + new_shares;
+        } else {
+            let pending_delegated_votes =
+                update_and_borrow_mut_delegated_votes(pool, governance_records, pending_voter);
+            pending_delegated_votes.active_shares_next_lockup =
+                pending_delegated_votes.active_shares_next_lockup + new_shares;
+        };
+    }
+
+    fun update_governance_records_for_buy_in_pending_inactive_shares(
+        pool: &DelegationPool, pool_address: address, new_shares: u128, shareholder: address
+    ) acquires GovernanceRecords {
+        // <pending inactive shares> of <shareholder> += <new_shares>   ---->
+        // <pending inactive shares> of <current voter of shareholder> += <new_shares>
+        // no impact on <pending inactive shares> of <next voter of shareholder>
+        let governance_records = borrow_global_mut<GovernanceRecords>(pool_address);
+        let current_voter = calculate_and_update_delegator_voter_internal(pool, governance_records, shareholder);
+        let current_delegated_votes = update_and_borrow_mut_delegated_votes(pool, governance_records, current_voter);
+        current_delegated_votes.pending_inactive_shares = current_delegated_votes.pending_inactive_shares + new_shares;
+    }
+
+    fun update_governanace_records_for_redeem_active_shares(
+        pool: &DelegationPool, pool_address: address, shares_to_redeem: u128, shareholder: address
+    ) acquires GovernanceRecords {
+        // <active shares> of <shareholder> -= <shares_to_redeem> ---->
+        // <active shares> of <current voter of shareholder> -= <shares_to_redeem>
+        // <active shares> of <next voter of shareholder> -= <shares_to_redeem>
+        let governance_records = borrow_global_mut<GovernanceRecords>(pool_address);
+        let vote_delegation = update_and_borrow_mut_delegator_vote_delegation(
+            pool,
+            governance_records,
+            shareholder
+        );
+        let current_voter = vote_delegation.voter;
+        let pending_voter = vote_delegation.pending_voter;
+        let current_delegated_votes = update_and_borrow_mut_delegated_votes(pool, governance_records, current_voter);
+        current_delegated_votes.active_shares = current_delegated_votes.active_shares - shares_to_redeem;
+        if (current_voter == pending_voter) {
+            current_delegated_votes.active_shares_next_lockup =
+                current_delegated_votes.active_shares_next_lockup - shares_to_redeem;
+        } else {
+            let pending_delegated_votes =
+                update_and_borrow_mut_delegated_votes(pool, governance_records, pending_voter);
+            pending_delegated_votes.active_shares_next_lockup =
+                pending_delegated_votes.active_shares_next_lockup - shares_to_redeem;
+        };
+    }
+
+    fun update_governanace_records_for_redeem_pending_inactive_shares(
+        pool: &DelegationPool, pool_address: address, shares_to_redeem: u128, shareholder: address
+    ) acquires GovernanceRecords {
+        // <pending inactive shares> of <shareholder> -= <shares_to_redeem>  ---->
+        // <pending inactive shares> of <current voter of shareholder> -= <shares_to_redeem>
+        // no impact on <pending inactive shares> of <next voter of shareholder>
+        let governance_records = borrow_global_mut<GovernanceRecords>(pool_address);
+        let current_voter = calculate_and_update_delegator_voter_internal(pool, governance_records, shareholder);
+        let current_delegated_votes = update_and_borrow_mut_delegated_votes(pool, governance_records, current_voter);
+        current_delegated_votes.pending_inactive_shares = current_delegated_votes.pending_inactive_shares - shares_to_redeem;
+    }
+
+    #[deprecated]
+    /// Deprecated, prefer math64::mul_div
+    public fun multiply_then_divide(x: u64, y: u64, z: u64): u64 {
+        math64::mul_div(x, y, z)
     }
 
     #[test_only]
     use aptos_framework::reconfiguration;
     #[test_only]
     use aptos_std::fixed_point64;
+    #[test_only]
+    use aptos_framework::stake::fast_forward_to_unlock;
     #[test_only]
     use aptos_framework::timestamp::fast_forward_seconds;
 
@@ -1029,7 +2003,7 @@ module aptos_framework::delegation_pool {
     #[test_only]
     const EPOCH_DURATION: u64 = 60;
     #[test_only]
-    const LOCKUP_CYCLE_SECONDS: u64 = 3600;
+    const LOCKUP_CYCLE_SECONDS: u64 = 2592000;
 
     #[test_only]
     const ONE_APT: u64 = 100000000;
@@ -1045,6 +2019,15 @@ module aptos_framework::delegation_pool {
     const DELEGATION_POOLS: u64 = 11;
 
     #[test_only]
+    const MODULE_EVENT: u64 = 26;
+
+    #[test_only]
+    const OPERATOR_BENEFICIARY_CHANGE: u64 = 39;
+
+    #[test_only]
+    const COMMISSION_CHANGE_DELEGATION_POOL: u64 = 42;
+
+    #[test_only]
     public fun end_aptos_epoch() {
         stake::end_epoch(); // additionally forwards EPOCH_DURATION seconds
         reconfiguration::reconfigure_for_test_custom();
@@ -1055,10 +2038,24 @@ module aptos_framework::delegation_pool {
         initialize_for_test_custom(
             aptos_framework,
             100 * ONE_APT,
-            10000 * ONE_APT,
+            10000000 * ONE_APT,
             LOCKUP_CYCLE_SECONDS,
             true,
             1,
+            100,
+            1000000
+        );
+    }
+
+    #[test_only]
+    public fun initialize_for_test_no_reward(aptos_framework: &signer) {
+        initialize_for_test_custom(
+            aptos_framework,
+            100 * ONE_APT,
+            10000000 * ONE_APT,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            0,
             100,
             1000000
         );
@@ -1087,7 +2084,7 @@ module aptos_framework::delegation_pool {
             voting_power_increase_limit,
         );
         reconfiguration::initialize_for_test(aptos_framework);
-        features::change_feature_flags(aptos_framework, vector[DELEGATION_POOLS], vector[]);
+        features::change_feature_flags_for_testing(aptos_framework, vector[DELEGATION_POOLS, MODULE_EVENT, OPERATOR_BENEFICIARY_CHANGE, COMMISSION_CHANGE_DELEGATION_POOL], vector[]);
     }
 
     #[test_only]
@@ -1096,13 +2093,24 @@ module aptos_framework::delegation_pool {
         amount: u64,
         should_join_validator_set: bool,
         should_end_epoch: bool,
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        initialize_test_validator_custom(validator, amount, should_join_validator_set, should_end_epoch, 0);
+    }
+
+    #[test_only]
+    public fun initialize_test_validator_custom(
+        validator: &signer,
+        amount: u64,
+        should_join_validator_set: bool,
+        should_end_epoch: bool,
+        commission_percentage: u64,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
         let validator_address = signer::address_of(validator);
         if (!account::exists_at(validator_address)) {
             account::create_account_for_test(validator_address);
         };
 
-        initialize_delegation_pool(validator, 0, vector::empty<u8>());
+        initialize_delegation_pool(validator, commission_percentage, vector::empty<u8>());
         let pool_address = get_owned_pool_address(validator_address);
 
         stake::rotate_consensus_key(validator, pool_address, CONSENSUS_KEY_1, CONSENSUS_POP_1);
@@ -1126,7 +2134,7 @@ module aptos_framework::delegation_pool {
         delegator: &signer,
         pool_address: address,
         amount: u64
-    ) acquires DelegationPool {
+    ) acquires DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
         synchronize_delegation_pool(pool_address);
 
         let pool = borrow_global_mut<DelegationPool>(pool_address);
@@ -1137,14 +2145,23 @@ module aptos_framework::delegation_pool {
         buy_in_pending_inactive_shares(pool, delegator_address, amount);
     }
 
+    #[test_only]
+    public fun enable_delegation_pool_allowlisting_feature(aptos_framework: &signer) {
+        features::change_feature_flags_for_testing(
+            aptos_framework,
+            vector[features::get_delegation_pool_allowlisting_feature()],
+            vector[]
+        );
+    }
+
     #[test(aptos_framework = @aptos_framework, validator = @0x123)]
     #[expected_failure(abort_code = 0x3000A, location = Self)]
     public entry fun test_delegation_pools_disabled(
         aptos_framework: &signer,
         validator: &signer,
-    ) {
+    ) acquires DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
         initialize_for_test(aptos_framework);
-        features::change_feature_flags(aptos_framework, vector[], vector[DELEGATION_POOLS]);
+        features::change_feature_flags_for_testing(aptos_framework, vector[], vector[DELEGATION_POOLS]);
 
         initialize_delegation_pool(validator, 0, vector::empty<u8>());
     }
@@ -1153,7 +2170,7 @@ module aptos_framework::delegation_pool {
     public entry fun test_set_operator_and_delegated_voter(
         aptos_framework: &signer,
         validator: &signer,
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
         initialize_for_test(aptos_framework);
 
         let validator_address = signer::address_of(validator);
@@ -1175,7 +2192,7 @@ module aptos_framework::delegation_pool {
     public entry fun test_cannot_set_operator(
         aptos_framework: &signer,
         validator: &signer,
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
         initialize_for_test(aptos_framework);
         // account does not own any delegation pool
         set_operator(validator, @0x111);
@@ -1186,7 +2203,7 @@ module aptos_framework::delegation_pool {
     public entry fun test_cannot_set_delegated_voter(
         aptos_framework: &signer,
         validator: &signer,
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
         initialize_for_test(aptos_framework);
         // account does not own any delegation pool
         set_delegated_voter(validator, @0x112);
@@ -1197,7 +2214,7 @@ module aptos_framework::delegation_pool {
     public entry fun test_already_owns_delegation_pool(
         aptos_framework: &signer,
         validator: &signer,
-    ) {
+    ) acquires DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
         initialize_for_test(aptos_framework);
         initialize_delegation_pool(validator, 0, x"00");
         initialize_delegation_pool(validator, 0, x"01");
@@ -1208,7 +2225,7 @@ module aptos_framework::delegation_pool {
     public entry fun test_cannot_withdraw_zero_stake(
         aptos_framework: &signer,
         validator: &signer,
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
         initialize_for_test(aptos_framework);
         initialize_delegation_pool(validator, 0, x"00");
         withdraw(validator, get_owned_pool_address(signer::address_of(validator)), 0);
@@ -1218,7 +2235,7 @@ module aptos_framework::delegation_pool {
     public entry fun test_initialize_delegation_pool(
         aptos_framework: &signer,
         validator: &signer,
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage {
         initialize_for_test(aptos_framework);
 
         let validator_address = signer::address_of(validator);
@@ -1245,7 +2262,7 @@ module aptos_framework::delegation_pool {
         validator: &signer,
         delegator1: &signer,
         delegator2: &signer,
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
         initialize_for_test_custom(
             aptos_framework,
             100 * ONE_APT,
@@ -1359,7 +2376,7 @@ module aptos_framework::delegation_pool {
             reward_period_start_time_in_sec,
             fixed_point64::create_from_rational(50, 100),
         );
-        features::change_feature_flags(aptos_framework, vector[features::get_periodical_reward_rate_decrease_feature()], vector[]);
+        features::change_feature_flags_for_testing(aptos_framework, vector[features::get_periodical_reward_rate_decrease_feature()], vector[]);
 
         // add more stake from delegator 1
         stake::mint(delegator1, 20000 * ONE_APT);
@@ -1388,7 +2405,7 @@ module aptos_framework::delegation_pool {
         aptos_framework: &signer,
         validator: &signer,
         delegator: &signer,
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
         initialize_for_test(aptos_framework);
         initialize_test_validator(validator, 1000 * ONE_APT, true, false);
 
@@ -1451,7 +2468,7 @@ module aptos_framework::delegation_pool {
     public entry fun test_add_stake_min_amount(
         aptos_framework: &signer,
         validator: &signer,
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
         initialize_for_test(aptos_framework);
         initialize_test_validator(validator, MIN_COINS_ON_SHARES_POOL - 1, false, false);
     }
@@ -1460,7 +2477,7 @@ module aptos_framework::delegation_pool {
     public entry fun test_add_stake_single(
         aptos_framework: &signer,
         validator: &signer,
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
         initialize_for_test(aptos_framework);
         initialize_test_validator(validator, 1000 * ONE_APT, false, false);
 
@@ -1550,7 +2567,7 @@ module aptos_framework::delegation_pool {
         aptos_framework: &signer,
         validator: &signer,
         delegator: &signer,
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
         initialize_for_test(aptos_framework);
         initialize_test_validator(validator, 1000 * ONE_APT, true, true);
 
@@ -1612,7 +2629,7 @@ module aptos_framework::delegation_pool {
         aptos_framework: &signer,
         validator: &signer,
         delegator: &signer,
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
         initialize_for_test(aptos_framework);
         initialize_test_validator(validator, 100 * ONE_APT, true, true);
 
@@ -1782,7 +2799,7 @@ module aptos_framework::delegation_pool {
         validator: &signer,
         delegator1: &signer,
         delegator2: &signer,
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
         initialize_for_test(aptos_framework);
         initialize_test_validator(validator, 200 * ONE_APT, true, true);
 
@@ -1889,7 +2906,7 @@ module aptos_framework::delegation_pool {
     public entry fun test_reactivate_stake_single(
         aptos_framework: &signer,
         validator: &signer,
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
         initialize_for_test(aptos_framework);
         initialize_test_validator(validator, 200 * ONE_APT, true, true);
 
@@ -1957,7 +2974,7 @@ module aptos_framework::delegation_pool {
         aptos_framework: &signer,
         validator: &signer,
         delegator: &signer,
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
         initialize_for_test(aptos_framework);
         initialize_test_validator(validator, 1000 * ONE_APT, true, true);
 
@@ -2033,7 +3050,7 @@ module aptos_framework::delegation_pool {
         aptos_framework: &signer,
         validator: &signer,
         delegator: &signer,
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
         initialize_for_test(aptos_framework);
         initialize_test_validator(validator, 1200 * ONE_APT, true, true);
 
@@ -2139,7 +3156,7 @@ module aptos_framework::delegation_pool {
     public entry fun test_active_stake_rewards(
         aptos_framework: &signer,
         validator: &signer,
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
         initialize_for_test(aptos_framework);
         initialize_test_validator(validator, 1000 * ONE_APT, true, true);
 
@@ -2212,7 +3229,7 @@ module aptos_framework::delegation_pool {
         aptos_framework: &signer,
         validator: &signer,
         delegator: &signer,
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
         initialize_for_test(aptos_framework);
         initialize_test_validator(validator, 200 * ONE_APT, true, true);
 
@@ -2272,7 +3289,7 @@ module aptos_framework::delegation_pool {
     public entry fun test_pending_inactive_stake_rewards(
         aptos_framework: &signer,
         validator: &signer,
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
         initialize_for_test(aptos_framework);
         initialize_test_validator(validator, 1000 * ONE_APT, true, true);
 
@@ -2319,7 +3336,7 @@ module aptos_framework::delegation_pool {
         validator: &signer,
         delegator1: &signer,
         delegator2: &signer,
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
         initialize_for_test(aptos_framework);
         initialize_test_validator(validator, 1000 * ONE_APT, true, true);
 
@@ -2398,7 +3415,7 @@ module aptos_framework::delegation_pool {
         validator: &signer,
         delegator1: &signer,
         delegator2: &signer,
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
         initialize_for_test(aptos_framework);
 
         let validator_address = signer::address_of(validator);
@@ -2547,7 +3564,7 @@ module aptos_framework::delegation_pool {
         old_operator: &signer,
         delegator: &signer,
         new_operator: &signer,
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
         initialize_for_test(aptos_framework);
 
         let old_operator_address = signer::address_of(old_operator);
@@ -2603,13 +3620,201 @@ module aptos_framework::delegation_pool {
         assert_delegation(new_operator_address, pool_address, 26050290, 0, 26050290);
     }
 
+    #[test(aptos_framework = @aptos_framework, operator1 = @0x123, delegator = @0x010, beneficiary = @0x020, operator2 = @0x030)]
+    public entry fun test_set_beneficiary_for_operator(
+        aptos_framework: &signer,
+        operator1: &signer,
+        delegator: &signer,
+        beneficiary: &signer,
+        operator2: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        initialize_for_test(aptos_framework);
+
+        let operator1_address = signer::address_of(operator1);
+        aptos_account::create_account(operator1_address);
+
+        let operator2_address = signer::address_of(operator2);
+        aptos_account::create_account(operator2_address);
+
+        let beneficiary_address = signer::address_of(beneficiary);
+        aptos_account::create_account(beneficiary_address);
+
+        // create delegation pool of commission fee 12.65%
+        initialize_delegation_pool(operator1, 1265, vector::empty<u8>());
+        let pool_address = get_owned_pool_address(operator1_address);
+        assert!(stake::get_operator(pool_address) == operator1_address, 0);
+        assert!(beneficiary_for_operator(operator1_address) == operator1_address, 0);
+
+        let delegator_address = signer::address_of(delegator);
+        account::create_account_for_test(delegator_address);
+
+        stake::mint(delegator, 2000000 * ONE_APT);
+        add_stake(delegator, pool_address, 2000000 * ONE_APT);
+        unlock(delegator, pool_address, 1000000 * ONE_APT);
+
+        // activate validator
+        stake::rotate_consensus_key(operator1, pool_address, CONSENSUS_KEY_1, CONSENSUS_POP_1);
+        stake::join_validator_set(operator1, pool_address);
+        end_aptos_epoch();
+
+        // produce active and pending_inactive rewards
+        end_aptos_epoch();
+        stake::assert_stake_pool(pool_address, 101000000000000, 0, 0, 101000000000000);
+        assert_delegation(operator1_address, pool_address, 126500000000, 0, 126500000000);
+        end_aptos_epoch();
+        stake::assert_stake_pool(pool_address, 102010000000000, 0, 0, 102010000000000);
+        assert_delegation(operator1_address, pool_address, 254265000000, 0, 254265000000);
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_aptos_epoch();
+
+        withdraw(operator1, pool_address, ONE_APT);
+        assert!(coin::balance<AptosCoin>(operator1_address) == ONE_APT - 1, 0);
+
+        set_beneficiary_for_operator(operator1, beneficiary_address);
+        assert!(beneficiary_for_operator(operator1_address) == beneficiary_address, 0);
+        end_aptos_epoch();
+
+        unlock(beneficiary, pool_address, ONE_APT);
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_aptos_epoch();
+
+        withdraw(beneficiary, pool_address, ONE_APT);
+        assert!(coin::balance<AptosCoin>(beneficiary_address) == ONE_APT - 1, 0);
+        assert!(coin::balance<AptosCoin>(operator1_address) == ONE_APT - 1, 0);
+
+        // switch operator to operator2. The rewards should go to operator2 not to the beneficiay of operator1.
+        set_operator(operator1, operator2_address);
+        end_aptos_epoch();
+        unlock(operator2, pool_address, ONE_APT);
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_aptos_epoch();
+
+        withdraw(operator2, pool_address, ONE_APT);
+        assert!(coin::balance<AptosCoin>(beneficiary_address) == ONE_APT - 1, 0);
+        assert!(coin::balance<AptosCoin>(operator2_address) == ONE_APT - 1, 0);
+    }
+
+    #[test(aptos_framework = @aptos_framework, operator = @0x123, delegator = @0x010)]
+    public entry fun test_update_commission_percentage(
+        aptos_framework: &signer,
+        operator: &signer,
+        delegator: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        initialize_for_test(aptos_framework);
+
+        let operator_address = signer::address_of(operator);
+        account::create_account_for_test(operator_address);
+
+        // create delegation pool of commission fee 12.65%
+        initialize_delegation_pool(operator, 1265, vector::empty<u8>());
+        let pool_address = get_owned_pool_address(operator_address);
+        assert!(stake::get_operator(pool_address) == operator_address, 0);
+
+        let delegator_address = signer::address_of(delegator);
+        account::create_account_for_test(delegator_address);
+
+        stake::mint(delegator, 200 * ONE_APT);
+        add_stake(delegator, pool_address, 200 * ONE_APT);
+        unlock(delegator, pool_address, 100 * ONE_APT);
+
+        // activate validator
+        stake::rotate_consensus_key(operator, pool_address, CONSENSUS_KEY_1, CONSENSUS_POP_1);
+        stake::join_validator_set(operator, pool_address);
+        end_aptos_epoch();
+
+        // produce active and pending_inactive rewards
+        end_aptos_epoch();
+        stake::assert_stake_pool(pool_address, 10100000000, 0, 0, 10100000000);
+        assert_delegation(operator_address, pool_address, 12650000, 0, 12650000);
+        end_aptos_epoch();
+        stake::assert_stake_pool(pool_address, 10201000000, 0, 0, 10201000000);
+        assert_delegation(operator_address, pool_address, 25426500, 0, 25426500);
+
+        // change the commission percentage
+        update_commission_percentage(operator, 2265);
+        // the new commission percentage does not take effect until the next lockup cycle.
+        assert!(operator_commission_percentage(pool_address) == 1265, 0);
+
+        // end the lockup cycle
+        fast_forward_to_unlock(pool_address);
+
+        // Test that the `get_add_stake_fee` correctly uses the new commission percentage, and returns the correct
+        // fee amount 76756290 in the following case, not 86593604 (calculated with the old commission rate).
+        assert!(get_add_stake_fee(pool_address, 100 * ONE_APT) == 76756290, 0);
+
+        synchronize_delegation_pool(pool_address);
+        // the commission percentage is updated to the new one.
+        assert!(operator_commission_percentage(pool_address) == 2265, 0);
+
+        end_aptos_epoch();
+        stake::assert_stake_pool(pool_address, 10406040100, 10303010000, 0, 0);
+        assert_delegation(operator_address, pool_address, 62187388, 38552865, 0);
+
+        end_aptos_epoch();
+        stake::assert_stake_pool(pool_address, 10510100501, 10303010000, 0, 0);
+        assert_delegation(operator_address, pool_address, 86058258, 38552865, 0);
+    }
+
+    #[test(aptos_framework = @aptos_framework, operator = @0x123, delegator = @0x010)]
+    #[expected_failure(abort_code=196629, location = Self)]
+    public entry fun test_last_minute_commission_rate_change_failed(
+        aptos_framework: &signer,
+        operator: &signer,
+        delegator: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        initialize_for_test(aptos_framework);
+
+        let operator_address = signer::address_of(operator);
+        account::create_account_for_test(operator_address);
+
+        // create delegation pool of commission fee 12.65%
+        initialize_delegation_pool(operator, 1265, vector::empty<u8>());
+        let pool_address = get_owned_pool_address(operator_address);
+        assert!(stake::get_operator(pool_address) == operator_address, 0);
+
+        let delegator_address = signer::address_of(delegator);
+        account::create_account_for_test(delegator_address);
+
+        stake::mint(delegator, 200 * ONE_APT);
+        add_stake(delegator, pool_address, 200 * ONE_APT);
+        unlock(delegator, pool_address, 100 * ONE_APT);
+
+        // activate validator
+        stake::rotate_consensus_key(operator, pool_address, CONSENSUS_KEY_1, CONSENSUS_POP_1);
+        stake::join_validator_set(operator, pool_address);
+        end_aptos_epoch();
+
+        // 30 days are remaining in the lockup period.
+        update_commission_percentage(operator, 2215);
+        timestamp::fast_forward_seconds(7 * 24 * 60 * 60);
+        end_aptos_epoch();
+
+        // 23 days are remaining in the lockup period.
+        update_commission_percentage(operator, 2225);
+        timestamp::fast_forward_seconds(7 * 24 * 60 * 60);
+        end_aptos_epoch();
+
+        // 16 days are remaining in the lockup period.
+        update_commission_percentage(operator, 2235);
+        timestamp::fast_forward_seconds(7 * 24 * 60 * 60);
+        end_aptos_epoch();
+
+        // 9 days are remaining in the lockup period.
+        update_commission_percentage(operator, 2245);
+        timestamp::fast_forward_seconds(7 * 24 * 60 * 60);
+        end_aptos_epoch();
+
+        // 2 days are remaining in the lockup period. So, the following line is expected to fail.
+        update_commission_percentage(operator, 2255);
+    }
+
     #[test(aptos_framework = @aptos_framework, validator = @0x123, delegator1 = @0x010, delegator2 = @0x020)]
     public entry fun test_min_stake_is_preserved(
         aptos_framework: &signer,
         validator: &signer,
         delegator1: &signer,
         delegator2: &signer,
-    ) acquires DelegationPoolOwnership, DelegationPool {
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
         initialize_for_test(aptos_framework);
         initialize_test_validator(validator, 100 * ONE_APT, true, false);
 
@@ -2709,6 +3914,1000 @@ module aptos_framework::delegation_pool {
         assert_delegation(delegator1_address, pool_address, 5049999998, 0, 0);
     }
 
+    #[test(aptos_framework = @aptos_framework, validator = @0x123, delegator1 = @0x010)]
+    #[expected_failure(abort_code = 0x1000f, location = Self)]
+    public entry fun test_create_proposal_abort_if_inefficient_stake(
+        aptos_framework: &signer,
+        validator: &signer,
+        delegator1: &signer,
+        // delegator2: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        initialize_for_test(aptos_framework);
+        aptos_governance::initialize_for_test(
+            aptos_framework,
+            (10 * ONE_APT as u128),
+            100 * ONE_APT,
+            1000,
+        );
+        aptos_governance::initialize_partial_voting(aptos_framework);
+        features::change_feature_flags_for_testing(
+            aptos_framework,
+            vector[features::get_partial_governance_voting(), features::get_delegation_pool_partial_governance_voting()],
+            vector[]);
+        initialize_test_validator(validator, 100 * ONE_APT, true, false);
+
+        let validator_address = signer::address_of(validator);
+        let pool_address = get_owned_pool_address(validator_address);
+        // Delegation pool is created after partial governance voting feature flag is enabled. So this delegation
+        // pool is created with partial governance voting enabled.
+        assert!(stake::get_delegated_voter(pool_address) == pool_address, 1);
+        assert!(partial_governance_voting_enabled(pool_address), 2);
+
+        let delegator1_address = signer::address_of(delegator1);
+        account::create_account_for_test(delegator1_address);
+        stake::mint(delegator1, 100 * ONE_APT);
+        add_stake(delegator1, pool_address, 10 * ONE_APT);
+        end_aptos_epoch();
+
+        let execution_hash = vector::empty<u8>();
+        vector::push_back(&mut execution_hash, 1);
+        create_proposal(
+                delegator1,
+                pool_address,
+                execution_hash,
+                b"",
+                b"",
+                true,
+            );
+    }
+
+    #[test(aptos_framework = @aptos_framework, validator = @0x123, delegator1 = @0x010)]
+    public entry fun test_create_proposal_with_sufficient_stake(
+        aptos_framework: &signer,
+        validator: &signer,
+        delegator1: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        initialize_for_test(aptos_framework);
+        aptos_governance::initialize_for_test(
+            aptos_framework,
+            (10 * ONE_APT as u128),
+            100 * ONE_APT,
+            1000,
+        );
+        aptos_governance::initialize_partial_voting(aptos_framework);
+        features::change_feature_flags_for_testing(
+            aptos_framework,
+            vector[features::get_partial_governance_voting(), features::get_delegation_pool_partial_governance_voting()],
+            vector[]);
+        initialize_test_validator(validator, 100 * ONE_APT, true, false);
+
+        let validator_address = signer::address_of(validator);
+        let pool_address = get_owned_pool_address(validator_address);
+        // Delegation pool is created after partial governance voting feature flag is enabled. So this delegation
+        // pool is created with partial governance voting enabled.
+        assert!(stake::get_delegated_voter(pool_address) == pool_address, 1);
+        assert!(partial_governance_voting_enabled(pool_address), 2);
+
+        let delegator1_address = signer::address_of(delegator1);
+        account::create_account_for_test(delegator1_address);
+        stake::mint(delegator1, 100 * ONE_APT);
+        add_stake(delegator1, pool_address, 100 * ONE_APT);
+        end_aptos_epoch();
+
+        let execution_hash = vector::empty<u8>();
+        vector::push_back(&mut execution_hash, 1);
+        create_proposal(
+            delegator1,
+            pool_address,
+            execution_hash,
+            b"",
+            b"",
+            true,
+        );
+    }
+
+    #[test(aptos_framework = @aptos_framework, validator = @0x123, delegator1 = @0x010, delegator2 = @0x020, voter1 = @0x030, voter2 = @0x040)]
+    public entry fun test_voting_power_change(
+        aptos_framework: &signer,
+        validator: &signer,
+        delegator1: &signer,
+        delegator2: &signer,
+        voter1: &signer,
+        voter2: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        initialize_for_test_no_reward(aptos_framework);
+        aptos_governance::initialize_for_test(
+            aptos_framework,
+            (10 * ONE_APT as u128),
+            100 * ONE_APT,
+            1000,
+        );
+        aptos_governance::initialize_partial_voting(aptos_framework);
+        features::change_feature_flags_for_testing(
+            aptos_framework,
+            vector[features::get_partial_governance_voting(), features::get_delegation_pool_partial_governance_voting()],
+            vector[]
+        );
+
+        initialize_test_validator(validator, 100 * ONE_APT, true, false);
+
+        let validator_address = signer::address_of(validator);
+        let pool_address = get_owned_pool_address(validator_address);
+        // Delegation pool is created after partial governance voting feature flag is enabled. So this delegation
+        // pool is created with partial governance voting enabled.
+        assert!(stake::get_delegated_voter(pool_address) == pool_address, 1);
+        assert!(partial_governance_voting_enabled(pool_address), 1);
+
+        let delegator1_address = signer::address_of(delegator1);
+        account::create_account_for_test(delegator1_address);
+        let delegator2_address = signer::address_of(delegator2);
+        account::create_account_for_test(delegator2_address);
+        let voter1_address = signer::address_of(voter1);
+        account::create_account_for_test(voter1_address);
+        let voter2_address = signer::address_of(voter2);
+        account::create_account_for_test(voter2_address);
+
+        stake::mint(delegator1, 110 * ONE_APT);
+        add_stake(delegator1, pool_address, 10 * ONE_APT);
+        stake::mint(delegator2, 110 * ONE_APT);
+        add_stake(delegator2, pool_address, 90 * ONE_APT);
+        // By default, the voter of a delegator is itself.
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter1_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter2_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator1_address) == 10 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator2_address) == 90 * ONE_APT, 1);
+
+        end_aptos_epoch();
+        // Reward rate is 0. No reward so no voting power change.
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter1_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter2_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator1_address) == 10 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator2_address) == 90 * ONE_APT, 1);
+
+        // Delegator1 delegates its voting power to voter1 but it takes 1 lockup cycle to take effects. So no voting power
+        // change now.
+        delegate_voting_power(delegator1, pool_address, voter1_address);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter1_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter2_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator1_address) == 10 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator2_address) == 90 * ONE_APT, 1);
+
+        // 1 epoch passed but the lockup cycle hasn't ended. No voting power change.
+        end_aptos_epoch();
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter1_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter2_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator1_address) == 10 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator2_address) == 90 * ONE_APT, 1);
+
+        // One cycle passed. The voter change takes effects.
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_aptos_epoch();
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter1_address) == 10 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter2_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator1_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator2_address) == 90 * ONE_APT, 1);
+
+        // Delegator2 delegates its voting power to voter1 but it takes 1 lockup cycle to take effects. So no voting power
+        // change now.
+        delegate_voting_power(delegator2, pool_address, voter1_address);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter1_address) == 10 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter2_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator1_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator2_address) == 90 * ONE_APT, 1);
+
+        // One cycle passed. The voter change takes effects.
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_aptos_epoch();
+        assert!(calculate_and_update_delegator_voter(pool_address, delegator2_address) == voter1_address, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter1_address) == 100 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter2_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator1_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator2_address) == 0, 1);
+
+        // delegator1 changes to voter2 then change back. delegator2 changes to voter1.
+        // No voting power change in this lockup cycle.
+        delegate_voting_power(delegator1, pool_address, voter2_address);
+        delegate_voting_power(delegator2, pool_address, voter2_address);
+        delegate_voting_power(delegator1, pool_address, voter1_address);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter1_address) == 100 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter2_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator1_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator2_address) == 0, 1);
+
+        // One cycle passed. The voter change takes effects.
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_aptos_epoch();
+        assert!(calculate_and_update_delegator_voter(pool_address, delegator1_address) == voter1_address, 1);
+        assert!(calculate_and_update_delegator_voter(pool_address, delegator2_address) == voter2_address, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter1_address) == 10 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter2_address) == 90 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator1_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator2_address) == 0, 1);
+
+        // delegator1 adds stake to the pool. Voting power changes immediately.
+        add_stake(delegator1, pool_address, 90 * ONE_APT);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter1_address) == 100 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter2_address) == 90 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator1_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator2_address) == 0, 1);
+
+        // delegator1 unlocks stake and changes its voter. No voting power change until next lockup cycle.
+        unlock(delegator1, pool_address, 90 * ONE_APT);
+        delegate_voting_power(delegator1, pool_address, voter2_address);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter1_address) == 100 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter2_address) == 90 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator1_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator2_address) == 0, 1);
+
+        // One cycle passed. The voter change takes effects.
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_aptos_epoch();
+        // Withdrawl inactive shares will not change voting power.
+        withdraw(delegator1, pool_address, 45 * ONE_APT);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter1_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter2_address) == 100 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator1_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator2_address) == 0, 1);
+
+        // voter2 adds stake for itself. Voting power changes immediately.
+        stake::mint(voter2, 110 * ONE_APT);
+        add_stake(voter2, pool_address, 10 * ONE_APT);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter1_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter2_address) == 110 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator1_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator2_address) == 0, 1);
+    }
+
+    #[test(aptos_framework = @aptos_framework, validator = @0x123, delegator1 = @0x010, voter1 = @0x030)]
+    public entry fun test_voting_power_change_for_existing_delegation_pool(
+        aptos_framework: &signer,
+        validator: &signer,
+        delegator1: &signer,
+        voter1: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        initialize_for_test_no_reward(aptos_framework);
+        aptos_governance::initialize_for_test(
+            aptos_framework,
+            (10 * ONE_APT as u128),
+            100 * ONE_APT,
+            1000,
+        );
+        aptos_governance::initialize_partial_voting(aptos_framework);
+
+        initialize_test_validator(validator, 100 * ONE_APT, true, false);
+
+        let validator_address = signer::address_of(validator);
+        let pool_address = get_owned_pool_address(validator_address);
+        // Delegation pool is created before partial governance voting feature flag is enabled. So this delegation
+        // pool's voter is its owner.
+        assert!(stake::get_delegated_voter(pool_address) == validator_address, 1);
+        assert!(!partial_governance_voting_enabled(pool_address), 1);
+
+        let delegator1_address = signer::address_of(delegator1);
+        account::create_account_for_test(delegator1_address);
+        let voter1_address = signer::address_of(voter1);
+        account::create_account_for_test(voter1_address);
+
+        stake::mint(delegator1, 110 * ONE_APT);
+        add_stake(delegator1, pool_address, 10 * ONE_APT);
+
+        // Enable partial governance voting feature flag.
+        features::change_feature_flags_for_testing(
+            aptos_framework,
+            vector[features::get_partial_governance_voting(), features::get_delegation_pool_partial_governance_voting()],
+            vector[]
+        );
+        // Voter doens't change until enabling partial governance voting on this delegation pool.
+        assert!(stake::get_delegated_voter(pool_address) == validator_address, 1);
+        // Enable partial governance voting on this delegation pool.
+        enable_partial_governance_voting(pool_address);
+        assert!(stake::get_delegated_voter(pool_address) == pool_address, 1);
+        assert!(partial_governance_voting_enabled(pool_address), 1);
+
+        // By default, the voter of a delegator is itself.
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter1_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator1_address) == 10 * ONE_APT, 1);
+
+        // Delegator1 delegates its voting power to voter1.
+        // It takes 1 cycle to take effect. No immediate change.
+        delegate_voting_power(delegator1, pool_address, voter1_address);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter1_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator1_address) == 10 * ONE_APT, 1);
+
+        // One cycle passed. The voter change takes effects.
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_aptos_epoch();
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter1_address) == 10 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator1_address) == 0, 1);
+    }
+
+    #[test(aptos_framework = @aptos_framework, validator = @0x123, delegator1 = @0x010, delegator2 = @0x020, voter1 = @0x030, voter2 = @0x040)]
+    public entry fun test_voting_power_change_for_rewards(
+        aptos_framework: &signer,
+        validator: &signer,
+        delegator1: &signer,
+        delegator2: &signer,
+        voter1: &signer,
+        voter2: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        initialize_for_test_custom(
+            aptos_framework,
+            100 * ONE_APT,
+            10000 * ONE_APT,
+            LOCKUP_CYCLE_SECONDS,
+            true,
+            100,
+            100,
+            1000000
+        );
+        aptos_governance::initialize_for_test(
+            aptos_framework,
+            (10 * ONE_APT as u128),
+            100 * ONE_APT,
+            1000,
+        );
+        aptos_governance::initialize_partial_voting(aptos_framework);
+        features::change_feature_flags_for_testing(
+            aptos_framework,
+            vector[features::get_partial_governance_voting(), features::get_delegation_pool_partial_governance_voting()],
+            vector[]
+        );
+
+        // 50% commission rate
+        initialize_test_validator_custom(validator, 100 * ONE_APT, true, false, 5000);
+
+        let validator_address = signer::address_of(validator);
+        let pool_address = get_owned_pool_address(validator_address);
+        // Delegation pool is created after partial governance voting feature flag is enabled. So this delegation
+        // pool is created with partial governance voting enabled.
+        assert!(stake::get_delegated_voter(pool_address) == pool_address, 1);
+        assert!(partial_governance_voting_enabled(pool_address), 1);
+
+        let delegator1_address = signer::address_of(delegator1);
+        account::create_account_for_test(delegator1_address);
+        let delegator2_address = signer::address_of(delegator2);
+        account::create_account_for_test(delegator2_address);
+        let voter1_address = signer::address_of(voter1);
+        account::create_account_for_test(voter1_address);
+        let voter2_address = signer::address_of(voter2);
+        account::create_account_for_test(voter2_address);
+
+        stake::mint(delegator1, 110 * ONE_APT);
+        add_stake(delegator1, pool_address, 10 * ONE_APT);
+        stake::mint(delegator2, 110 * ONE_APT);
+        add_stake(delegator2, pool_address, 90 * ONE_APT);
+        // By default, the voter of a delegator is itself.
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, validator_address) == 100 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter1_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter2_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator1_address) == 10 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator2_address) == 90 * ONE_APT, 1);
+
+        // One epoch is passed. Delegators earn no reward because their stake was inactive.
+        end_aptos_epoch();
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, validator_address) == 100 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter1_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter2_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator1_address) == 10 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator2_address) == 90 * ONE_APT, 1);
+
+        // 2 epoches are passed. Delegators earn reward and voting power increases. Operator earns reward and
+        // commission. Because there is no operation during these 2 epoches. Operator's commission is not compounded.
+        end_aptos_epoch();
+        end_aptos_epoch();
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, validator_address) == 550 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator1_address) == 25 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator2_address) == 225 * ONE_APT, 1);
+
+        // Another epoch is passed. Voting power chage due to reward is correct even if delegator1 and delegator2 change its voter.
+        delegate_voting_power(delegator1, pool_address, voter1_address);
+        delegate_voting_power(delegator2, pool_address, voter1_address);
+        timestamp::fast_forward_seconds(LOCKUP_CYCLE_SECONDS);
+        end_aptos_epoch();
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, validator_address) == 122499999999, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter1_address) == 375 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, voter2_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator1_address) == 0, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator2_address) == 0, 1);
+    }
+
+    #[test(aptos_framework = @aptos_framework, validator = @0x123, delegator1 = @0x010, delegator2 = @0x020, voter1 = @0x030, voter2 = @0x040)]
+    public entry fun test_voting_power_change_already_voted_before_partial(
+        aptos_framework: &signer,
+        validator: &signer,
+        delegator1: &signer,
+        delegator2: &signer,
+        voter1: &signer,
+        voter2: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        // partial voing hasn't been enabled yet. A proposal has been created by the validator.
+        let proposal1_id = setup_vote(aptos_framework, validator, false);
+
+        let validator_address = signer::address_of(validator);
+        let pool_address = get_owned_pool_address(validator_address);
+
+        let delegator1_address = signer::address_of(delegator1);
+        account::create_account_for_test(delegator1_address);
+        let delegator2_address = signer::address_of(delegator2);
+        account::create_account_for_test(delegator2_address);
+        let voter1_address = signer::address_of(voter1);
+        account::create_account_for_test(voter1_address);
+        let voter2_address = signer::address_of(voter2);
+        account::create_account_for_test(voter2_address);
+
+        stake::mint(delegator1, 110 * ONE_APT);
+        add_stake(delegator1, pool_address, 10 * ONE_APT);
+        stake::mint(delegator2, 110 * ONE_APT);
+        add_stake(delegator2, pool_address, 90 * ONE_APT);
+
+        // Create 2 proposals and vote for proposal1.
+        let execution_hash = vector::empty<u8>();
+        vector::push_back(&mut execution_hash, 1);
+        let proposal2_id = aptos_governance::create_proposal_v2_impl(
+            validator,
+            pool_address,
+            execution_hash,
+            b"",
+            b"",
+            true,
+        );
+        aptos_governance::vote(validator, pool_address, proposal1_id, true);
+
+        // Enable partial governance voting feature flag.
+        features::change_feature_flags_for_testing(
+            aptos_framework,
+            vector[features::get_partial_governance_voting(), features::get_delegation_pool_partial_governance_voting()],
+            vector[]
+        );
+        // Voter doens't change until enabling partial governance voting on this delegation pool.
+        assert!(stake::get_delegated_voter(pool_address) == validator_address, 1);
+        // Enable partial governance voting on this delegation pool.
+        enable_partial_governance_voting(pool_address);
+        assert!(stake::get_delegated_voter(pool_address) == pool_address, 1);
+        assert!(partial_governance_voting_enabled(pool_address), 1);
+
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, validator_address) == 100 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator1_address) == 10 * ONE_APT, 1);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator2_address) == 90 * ONE_APT, 1);
+        // No one can vote for proposal1 because it's already voted before enabling partial governance voting.
+        assert!(calculate_and_update_remaining_voting_power(pool_address, validator_address, proposal1_id) == 0, 1);
+        assert!(calculate_and_update_remaining_voting_power(pool_address, delegator1_address, proposal1_id) == 0, 1);
+        assert!(calculate_and_update_remaining_voting_power(pool_address, delegator2_address, proposal1_id) == 0, 1);
+        assert!(calculate_and_update_remaining_voting_power(pool_address, validator_address, proposal2_id) == 100 * ONE_APT, 1);
+        assert!(calculate_and_update_remaining_voting_power(pool_address, delegator1_address, proposal2_id) == 10 * ONE_APT, 1);
+        assert!(calculate_and_update_remaining_voting_power(pool_address, delegator2_address, proposal2_id) == 90 * ONE_APT, 1);
+
+        // Delegator1 tries to use 50 APT to vote on proposal2, but it only has 10 APT. So only 10 APT voting power is used.
+        vote(delegator1, pool_address, proposal2_id, 50 * ONE_APT, true);
+        assert!(calculate_and_update_remaining_voting_power(pool_address, delegator1_address, proposal2_id) == 0, 1);
+
+        add_stake(delegator1, pool_address, 60 * ONE_APT);
+        assert!(calculate_and_update_voter_total_voting_power(pool_address, delegator1_address) == 70 * ONE_APT, 1);
+        vote(delegator1, pool_address, proposal2_id, 25 * ONE_APT, true);
+        assert!(calculate_and_update_remaining_voting_power(pool_address, delegator1_address, proposal2_id) == 35 * ONE_APT, 1);
+        vote(delegator1, pool_address, proposal2_id, 30 * ONE_APT, false);
+        assert!(calculate_and_update_remaining_voting_power(pool_address, delegator1_address, proposal2_id) == 5 * ONE_APT, 1);
+    }
+
+    #[test(aptos_framework = @aptos_framework, validator = @0x123, delegator1 = @0x010, voter1 = @0x030)]
+    #[expected_failure(abort_code=0x10010, location = Self)]
+    public entry fun test_vote_should_failed_if_already_voted_before_enable_partial_voting_flag(
+        aptos_framework: &signer,
+        validator: &signer,
+        delegator1: &signer,
+        voter1: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        // partial voing hasn't been enabled yet. A proposal has been created by the validator.
+        let proposal1_id = setup_vote(aptos_framework, validator, false);
+
+        let validator_address = signer::address_of(validator);
+        let pool_address = get_owned_pool_address(validator_address);
+        let delegator1_address = signer::address_of(delegator1);
+        account::create_account_for_test(delegator1_address);
+        let voter1_address = signer::address_of(voter1);
+        account::create_account_for_test(voter1_address);
+
+        stake::mint(delegator1, 110 * ONE_APT);
+        add_stake(delegator1, pool_address, 10 * ONE_APT);
+        end_aptos_epoch();
+
+        aptos_governance::vote(validator, pool_address, proposal1_id, true);
+
+        // Enable partial governance voting feature flag.
+        features::change_feature_flags_for_testing(
+            aptos_framework,
+            vector[features::get_partial_governance_voting(), features::get_delegation_pool_partial_governance_voting()],
+            vector[]
+        );
+        // Enable partial governance voting on this delegation pool.
+        enable_partial_governance_voting(pool_address);
+
+        vote(delegator1, pool_address, proposal1_id, 10 * ONE_APT, true);
+    }
+
+    #[test(aptos_framework = @aptos_framework, validator = @0x123, delegator1 = @0x010, voter1 = @0x030)]
+    #[expected_failure(abort_code=0x10011, location = Self)]
+    public entry fun test_vote_should_failed_if_already_voted_before_enable_partial_voting_on_pool(
+        aptos_framework: &signer,
+        validator: &signer,
+        delegator1: &signer,
+        voter1: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        // partial voing hasn't been enabled yet. A proposal has been created by the validator.
+        let proposal1_id = setup_vote(aptos_framework, validator, false);
+
+        let validator_address = signer::address_of(validator);
+        let pool_address = get_owned_pool_address(validator_address);
+        let delegator1_address = signer::address_of(delegator1);
+        account::create_account_for_test(delegator1_address);
+        let voter1_address = signer::address_of(voter1);
+        account::create_account_for_test(voter1_address);
+
+        stake::mint(delegator1, 110 * ONE_APT);
+        add_stake(delegator1, pool_address, 10 * ONE_APT);
+        end_aptos_epoch();
+
+        // Enable partial governance voting feature flag.
+        features::change_feature_flags_for_testing(
+            aptos_framework,
+            vector[features::get_partial_governance_voting(), features::get_delegation_pool_partial_governance_voting()],
+            vector[]
+        );
+
+        // The operator voter votes on the proposal after partial governace voting flag is enabled but before partial voting is enabled on the pool.
+        aptos_governance::vote(validator, pool_address, proposal1_id, true);
+
+        // Enable partial governance voting on this delegation pool.
+        enable_partial_governance_voting(pool_address);
+
+        add_stake(delegator1, pool_address, 10 * ONE_APT);
+        vote(delegator1, pool_address, proposal1_id, 10 * ONE_APT, true);
+    }
+
+    #[test(aptos_framework = @aptos_framework, validator = @0x123, delegator1 = @0x010)]
+    #[expected_failure(abort_code=0x10010, location = Self)]
+    public entry fun test_vote_should_failed_if_no_stake(
+        aptos_framework: &signer,
+        validator: &signer,
+        delegator1: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        // partial voing hasn't been enabled yet. A proposal has been created by the validator.
+        let proposal1_id = setup_vote(aptos_framework, validator, true);
+
+        let validator_address = signer::address_of(validator);
+        let pool_address = get_owned_pool_address(validator_address);
+        let delegator1_address = signer::address_of(delegator1);
+        account::create_account_for_test(delegator1_address);
+
+        // Delegator1 has no stake. Abort.
+        vote(delegator1, pool_address, proposal1_id, 10 * ONE_APT, true);
+    }
+
+    #[test(aptos_framework = @aptos_framework, validator = @0x123, delegator1 = @0x010, voter1 = @0x030)]
+    public entry fun test_delegate_voting_power_should_pass_even_if_no_stake(
+        aptos_framework: &signer,
+        validator: &signer,
+        delegator1: &signer,
+        voter1: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        // partial voing hasn't been enabled yet. A proposal has been created by the validator.
+        setup_vote(aptos_framework, validator, true);
+
+        let validator_address = signer::address_of(validator);
+        let pool_address = get_owned_pool_address(validator_address);
+        let delegator1_address = signer::address_of(delegator1);
+        account::create_account_for_test(delegator1_address);
+
+        // Delegator1 has no stake. Abort.
+        delegate_voting_power(delegator1, pool_address, signer::address_of(voter1));
+    }
+
+    #[test(staker = @0xe256f4f4e2986cada739e339895cf5585082ff247464cab8ec56eea726bd2263)]
+    public entry fun test_get_expected_stake_pool_address(staker: address) {
+        let pool_address = get_expected_stake_pool_address(staker, vector[0x42, 0x42]);
+        assert!(pool_address == @0xe9fc2fbb82b7e1cb7af3daef8c7a24e66780f9122d15e4f1d486ee7c7c36c48d, 0);
+    }
+
+    #[test(aptos_framework = @aptos_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x30017, location = Self)]
+    public entry fun test_delegators_allowlisting_not_supported(
+        aptos_framework: &signer,
+        validator: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        initialize_for_test(aptos_framework);
+        initialize_test_validator(validator, 100 * ONE_APT, true, true);
+        features::change_feature_flags_for_testing(
+            aptos_framework,
+            vector[],
+            vector[features::get_delegation_pool_allowlisting_feature()],
+        );
+
+        enable_delegators_allowlisting(validator);
+    }
+
+    #[test(aptos_framework = @aptos_framework, validator = @0x123)]
+    #[expected_failure(abort_code = 0x30018, location = Self)]
+    public entry fun test_cannot_disable_allowlisting_if_already_off(
+        aptos_framework: &signer,
+        validator: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        initialize_for_test(aptos_framework);
+        initialize_test_validator(validator, 100 * ONE_APT, true, true);
+
+        let pool_address = get_owned_pool_address(signer::address_of(validator));
+        assert!(!allowlisting_enabled(pool_address), 0);
+
+        disable_delegators_allowlisting(validator);
+    }
+
+    #[test(aptos_framework = @aptos_framework, validator = @0x123, delegator_1 = @0x010)]
+    #[expected_failure(abort_code = 0x30018, location = Self)]
+    public entry fun test_cannot_allowlist_delegator_if_allowlisting_disabled(
+        aptos_framework: &signer,
+        validator: &signer,
+        delegator_1: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        initialize_for_test(aptos_framework);
+        initialize_test_validator(validator, 100 * ONE_APT, true, true);
+
+        let pool_address = get_owned_pool_address(signer::address_of(validator));
+        assert!(!allowlisting_enabled(pool_address), 0);
+
+        allowlist_delegator(validator, signer::address_of(delegator_1));
+    }
+
+    #[test(aptos_framework = @aptos_framework, validator = @0x123, delegator_1 = @0x010)]
+    #[expected_failure(abort_code = 0x30018, location = Self)]
+    public entry fun test_cannot_remove_delegator_from_allowlist_if_allowlisting_disabled(
+        aptos_framework: &signer,
+        validator: &signer,
+        delegator_1: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        initialize_for_test(aptos_framework);
+        initialize_test_validator(validator, 100 * ONE_APT, true, true);
+
+        let pool_address = get_owned_pool_address(signer::address_of(validator));
+        assert!(!allowlisting_enabled(pool_address), 0);
+
+        remove_delegator_from_allowlist(validator, signer::address_of(delegator_1));
+    }
+
+    #[test(aptos_framework = @aptos_framework, validator = @0x123, delegator_1 = @0x010)]
+    #[expected_failure(abort_code = 0x30018, location = Self)]
+    public entry fun test_cannot_evict_delegator_if_allowlisting_disabled(
+        aptos_framework: &signer,
+        validator: &signer,
+        delegator_1: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        initialize_for_test(aptos_framework);
+        initialize_test_validator(validator, 100 * ONE_APT, true, true);
+
+        let pool_address = get_owned_pool_address(signer::address_of(validator));
+        assert!(!allowlisting_enabled(pool_address), 0);
+
+        evict_delegator(validator, signer::address_of(delegator_1));
+    }
+
+    #[test(aptos_framework = @aptos_framework, validator = @0x123, delegator_1 = @0x010, delegator_2 = @0x020)]
+    public entry fun test_allowlist_operations_only_e2e(
+        aptos_framework: &signer,
+        validator: &signer,
+        delegator_1: &signer,
+        delegator_2: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        initialize_for_test(aptos_framework);
+        initialize_test_validator(validator, 100 * ONE_APT, true, true);
+        enable_delegation_pool_allowlisting_feature(aptos_framework);
+
+        let validator_address = signer::address_of(validator);
+        let pool_address = get_owned_pool_address(validator_address);
+        let delegator_1_address = signer::address_of(delegator_1);
+        let delegator_2_address = signer::address_of(delegator_2);
+
+        // any address is allowlisted if allowlist is not created
+        assert!(!allowlisting_enabled(pool_address), 0);
+        assert!(delegator_allowlisted(pool_address, delegator_1_address), 0);
+        assert!(delegator_allowlisted(pool_address, delegator_2_address), 0);
+
+        // no address is allowlisted when allowlist is empty
+        enable_delegators_allowlisting(validator);
+        assert!(!delegator_allowlisted(pool_address, delegator_1_address), 0);
+        assert!(!delegator_allowlisted(pool_address, delegator_2_address), 0);
+        let allowlist = &get_delegators_allowlist(pool_address);
+        assert!(vector::length(allowlist) == 0, 0);
+
+        allowlist_delegator(validator, delegator_1_address);
+        assert!(delegator_allowlisted(pool_address, delegator_1_address), 0);
+        assert!(!delegator_allowlisted(pool_address, delegator_2_address), 0);
+        allowlist = &get_delegators_allowlist(pool_address);
+        assert!(vector::length(allowlist) == 1 && vector::contains(allowlist, &delegator_1_address), 0);
+
+        allowlist_delegator(validator, delegator_2_address);
+        assert!(delegator_allowlisted(pool_address, delegator_1_address), 0);
+        assert!(delegator_allowlisted(pool_address, delegator_2_address), 0);
+        allowlist = &get_delegators_allowlist(pool_address);
+        assert!(vector::length(allowlist) == 2 &&
+            vector::contains(allowlist, &delegator_1_address) &&
+            vector::contains(allowlist, &delegator_2_address),
+            0
+        );
+
+        remove_delegator_from_allowlist(validator, delegator_2_address);
+        assert!(delegator_allowlisted(pool_address, delegator_1_address), 0);
+        assert!(!delegator_allowlisted(pool_address, delegator_2_address), 0);
+        allowlist = &get_delegators_allowlist(pool_address);
+        assert!(vector::length(allowlist) == 1 && vector::contains(allowlist, &delegator_1_address), 0);
+
+        // destroy the allowlist constructed so far
+        disable_delegators_allowlisting(validator);
+        assert!(!allowlisting_enabled(pool_address), 0);
+        assert!(delegator_allowlisted(pool_address, delegator_1_address), 0);
+        assert!(delegator_allowlisted(pool_address, delegator_2_address), 0);
+
+        enable_delegators_allowlisting(validator);
+        assert!(!delegator_allowlisted(pool_address, delegator_1_address), 0);
+        assert!(!delegator_allowlisted(pool_address, delegator_2_address), 0);
+
+        allowlist_delegator(validator, delegator_2_address);
+        assert!(!delegator_allowlisted(pool_address, delegator_1_address), 0);
+        assert!(delegator_allowlisted(pool_address, delegator_2_address), 0);
+        allowlist = &get_delegators_allowlist(pool_address);
+        assert!(vector::length(allowlist) == 1 && vector::contains(allowlist, &delegator_2_address), 0);
+
+        // allowlist does not ever have duplicates
+        allowlist_delegator(validator, delegator_2_address);
+        allowlist = &get_delegators_allowlist(pool_address);
+        assert!(vector::length(allowlist) == 1 && vector::contains(allowlist, &delegator_2_address), 0);
+
+        // no override of existing allowlist when enabling allowlisting again
+        enable_delegators_allowlisting(validator);
+        allowlist = &get_delegators_allowlist(pool_address);
+        assert!(vector::length(allowlist) == 1 && vector::contains(allowlist, &delegator_2_address), 0);
+
+        // nothing changes when trying to remove an inexistent delegator
+        remove_delegator_from_allowlist(validator, delegator_1_address);
+        allowlist = &get_delegators_allowlist(pool_address);
+        assert!(vector::length(allowlist) == 1 && vector::contains(allowlist, &delegator_2_address), 0);
+    }
+
+    #[test(aptos_framework = @aptos_framework, validator = @0x123, delegator_1 = @0x010)]
+    #[expected_failure(abort_code = 0x3001a, location = Self)]
+    public entry fun test_cannot_evict_explicitly_allowlisted_delegator(
+        aptos_framework: &signer,
+        validator: &signer,
+        delegator_1: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        initialize_for_test(aptos_framework);
+        initialize_test_validator(validator, 100 * ONE_APT, true, true);
+        enable_delegation_pool_allowlisting_feature(aptos_framework);
+
+        let validator_address = signer::address_of(validator);
+        let pool_address = get_owned_pool_address(validator_address);
+
+        enable_delegators_allowlisting(validator);
+        assert!(allowlisting_enabled(pool_address), 0);
+
+        let delegator_1_address = signer::address_of(delegator_1);
+        allowlist_delegator(validator, delegator_1_address);
+
+        assert!(delegator_allowlisted(pool_address, delegator_1_address), 0);
+        evict_delegator(validator, delegator_1_address);
+    }
+
+    #[test(aptos_framework = @aptos_framework, validator = @0x123, delegator_1 = @0x010)]
+    #[expected_failure(abort_code = 0x1001b, location = Self)]
+    public entry fun test_cannot_evict_null_address(
+        aptos_framework: &signer,
+        validator: &signer,
+        delegator_1: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        initialize_for_test(aptos_framework);
+        initialize_test_validator(validator, 100 * ONE_APT, true, true);
+        enable_delegation_pool_allowlisting_feature(aptos_framework);
+
+        let validator_address = signer::address_of(validator);
+        let pool_address = get_owned_pool_address(validator_address);
+
+        let delegator_1_address = signer::address_of(delegator_1);
+        account::create_account_for_test(delegator_1_address);
+
+        // add some active shares to NULL_SHAREHOLDER from `add_stake` fee
+        stake::mint(delegator_1, 50 * ONE_APT);
+        add_stake(delegator_1, pool_address, 50 * ONE_APT);
+        assert!(get_delegator_active_shares(borrow_global<DelegationPool>(pool_address), NULL_SHAREHOLDER) != 0, 0);
+
+        enable_delegators_allowlisting(validator);
+        evict_delegator(validator, NULL_SHAREHOLDER);
+    }
+
+    #[test(aptos_framework = @aptos_framework, validator = @0x123, delegator_1 = @0x010)]
+    #[expected_failure(abort_code = 0x50019, location = Self)]
+    public entry fun test_cannot_add_stake_if_not_allowlisted(
+        aptos_framework: &signer,
+        validator: &signer,
+        delegator_1: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        initialize_for_test(aptos_framework);
+        initialize_test_validator(validator, 100 * ONE_APT, true, true);
+        enable_delegation_pool_allowlisting_feature(aptos_framework);
+
+        let validator_address = signer::address_of(validator);
+        let pool_address = get_owned_pool_address(validator_address);
+
+        let delegator_1_address = signer::address_of(delegator_1);
+        account::create_account_for_test(delegator_1_address);
+
+        // allowlisting not enabled yet
+        assert!(!allowlisting_enabled(pool_address), 0);
+        assert!(delegator_allowlisted(pool_address, delegator_1_address), 0);
+
+        stake::mint(delegator_1, 30 * ONE_APT);
+        add_stake(delegator_1, pool_address, 20 * ONE_APT);
+
+        end_aptos_epoch();
+        assert_delegation(delegator_1_address, pool_address, 20 * ONE_APT, 0, 0);
+
+        // allowlist is created but has no address added
+        enable_delegators_allowlisting(validator);
+        assert!(allowlisting_enabled(pool_address), 0);
+        assert!(!delegator_allowlisted(pool_address, delegator_1_address), 0);
+
+        add_stake(delegator_1, pool_address, 10 * ONE_APT);
+    }
+
+    #[test(aptos_framework = @aptos_framework, validator = @0x123, delegator_1 = @0x010)]
+    #[expected_failure(abort_code = 0x50019, location = Self)]
+    public entry fun test_cannot_reactivate_stake_if_not_allowlisted(
+        aptos_framework: &signer,
+        validator: &signer,
+        delegator_1: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        initialize_for_test(aptos_framework);
+        initialize_test_validator(validator, 100 * ONE_APT, true, true);
+        enable_delegation_pool_allowlisting_feature(aptos_framework);
+
+        let validator_address = signer::address_of(validator);
+        let pool_address = get_owned_pool_address(validator_address);
+
+        let delegator_1_address = signer::address_of(delegator_1);
+        account::create_account_for_test(delegator_1_address);
+
+        // allowlist is created but has no address added
+        enable_delegators_allowlisting(validator);
+        // allowlist delegator
+        allowlist_delegator(validator, delegator_1_address);
+        assert!(delegator_allowlisted(pool_address, delegator_1_address), 0);
+
+        // delegator is allowed to add stake
+        stake::mint(delegator_1, 50 * ONE_APT);
+        add_stake(delegator_1, pool_address, 50 * ONE_APT);
+
+        // restore `add_stake` fee back to delegator
+        end_aptos_epoch();
+        assert_delegation(delegator_1_address, pool_address, 50 * ONE_APT, 0, 0);
+
+        // some of the stake is unlocked by the delegator
+        unlock(delegator_1, pool_address, 30 * ONE_APT);
+        assert_delegation(delegator_1_address, pool_address, 20 * ONE_APT, 0, 2999999999);
+
+        // remove delegator from allowlist
+        remove_delegator_from_allowlist(validator, delegator_1_address);
+        assert!(!delegator_allowlisted(pool_address, delegator_1_address), 0);
+
+        // remaining stake is unlocked by the pool owner by evicting the delegator
+        evict_delegator(validator, delegator_1_address);
+        assert_delegation(delegator_1_address, pool_address, 0, 0, 4999999999);
+
+        // delegator cannot reactivate stake
+        reactivate_stake(delegator_1, pool_address, 50 * ONE_APT);
+        assert_delegation(delegator_1_address, pool_address, 0, 0, 4999999999);
+    }
+
+    #[test(aptos_framework = @aptos_framework, validator = @0x123, delegator_1 = @0x010, delegator_2 = @0x020)]
+    public entry fun test_delegation_pool_allowlisting_e2e(
+        aptos_framework: &signer,
+        validator: &signer,
+        delegator_1: &signer,
+        delegator_2: &signer,
+    ) acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        initialize_for_test(aptos_framework);
+        initialize_test_validator(validator, 100 * ONE_APT, true, true);
+        enable_delegation_pool_allowlisting_feature(aptos_framework);
+
+        let validator_address = signer::address_of(validator);
+        let pool_address = get_owned_pool_address(validator_address);
+
+        let delegator_1_address = signer::address_of(delegator_1);
+        account::create_account_for_test(delegator_1_address);
+        let delegator_2_address = signer::address_of(delegator_2);
+        account::create_account_for_test(delegator_2_address);
+
+        // add stake while allowlisting is disabled
+        assert!(!allowlisting_enabled(pool_address), 0);
+        stake::mint(delegator_1, 100 * ONE_APT);
+        stake::mint(delegator_2, 100 * ONE_APT);
+        add_stake(delegator_1, pool_address, 50 * ONE_APT);
+        add_stake(delegator_2, pool_address, 30 * ONE_APT);
+
+        end_aptos_epoch();
+        assert_delegation(delegator_1_address, pool_address, 50 * ONE_APT, 0, 0);
+        assert_delegation(delegator_2_address, pool_address, 30 * ONE_APT, 0, 0);
+
+        // create allowlist
+        enable_delegators_allowlisting(validator);
+        assert!(allowlisting_enabled(pool_address), 0);
+        assert!(!delegator_allowlisted(pool_address, delegator_1_address), 0);
+        assert!(!delegator_allowlisted(pool_address, delegator_2_address), 0);
+
+        allowlist_delegator(validator, delegator_1_address);
+        assert!(delegator_allowlisted(pool_address, delegator_1_address), 0);
+        assert!(!delegator_allowlisted(pool_address, delegator_2_address), 0);
+
+        // evict delegator 2 which unlocks their entire active stake
+        evict_delegator(validator, delegator_2_address);
+        assert_delegation(delegator_2_address, pool_address, 0, 0, 30 * ONE_APT);
+
+        end_aptos_epoch();
+        // 5000000000 * 1.01 active
+        assert_delegation(delegator_1_address, pool_address, 5050000000, 0, 0);
+        // 3000000000 * 1.01 pending-inactive
+        assert_delegation(delegator_2_address, pool_address, 0, 0, 3030000000);
+
+        // can add stake when allowlisted
+        add_stake(delegator_1, pool_address, 10 * ONE_APT);
+        end_aptos_epoch();
+        // 5050000000 * 1.01 + 1000000000 active
+        assert_delegation(delegator_1_address, pool_address, 6100500000, 0, 0);
+        // 3030000000 * 1.01 pending-inactive
+        assert_delegation(delegator_2_address, pool_address, 0, 0, 3060300000);
+
+        end_aptos_epoch();
+        // 6100500000 * 1.01 active
+        assert_delegation(delegator_1_address, pool_address, 6161505000, 0, 0);
+        // 3060300000 * 1.01 pending-inactive
+        assert_delegation(delegator_2_address, pool_address, 0, 0, 3090903000);
+
+        remove_delegator_from_allowlist(validator, delegator_1_address);
+        assert!(!delegator_allowlisted(pool_address, delegator_1_address), 0);
+
+        // check that in-flight active rewards are evicted too, which validates that `synchronize_delegation_pool` was called
+        let active = pool_u64::balance(
+            &borrow_global<DelegationPool>(pool_address).active_shares,
+            delegator_1_address
+        ) + get_add_stake_fee(pool_address, 10 * ONE_APT);
+        // 5050000000 + 1000000000 active at last `synchronize_delegation_pool`
+        assert!(active == 6050000000, active);
+
+        evict_delegator(validator, delegator_1_address);
+        assert_delegation(delegator_1_address, pool_address, 0, 0, 6161504999);
+        let pending_inactive = pool_u64::balance(
+            pending_inactive_shares_pool(borrow_global<DelegationPool>(pool_address)),
+            delegator_1_address
+        );
+        assert!(pending_inactive == 6161504999, pending_inactive);
+
+        // allowlist delegator 1 back and check that they can add stake
+        allowlist_delegator(validator, delegator_1_address);
+        add_stake(delegator_1, pool_address, 20 * ONE_APT);
+        end_aptos_epoch();
+        // 2000000000 active and 6161505000 * 1.01 pending-inactive
+        assert_delegation(delegator_1_address, pool_address, 20 * ONE_APT, 0, 6223120049);
+
+        // can reactivate stake when allowlisted
+        reactivate_stake(delegator_1, pool_address, 5223120050);
+        assert_delegation(delegator_1_address, pool_address, 20 * ONE_APT + 5223120049, 0, 10 * ONE_APT);
+
+        // evict delegator 1 after they reactivated
+        remove_delegator_from_allowlist(validator, delegator_1_address);
+        evict_delegator(validator, delegator_1_address);
+        // 2000000000 + 5223120050 + 1000000000 pending-inactive
+        assert_delegation(delegator_1_address, pool_address, 0, 0, 8223120049);
+
+        end_aptos_epoch();
+        // (2000000000 + 5223120050 + 1000000000) * 1.01 pending-inactive
+        assert_delegation(delegator_1_address, pool_address, 0, 0, 8305351249);
+    }
+
     #[test_only]
     public fun assert_delegation(
         delegator_address: address,
@@ -2716,7 +4915,7 @@ module aptos_framework::delegation_pool {
         active_stake: u64,
         inactive_stake: u64,
         pending_inactive_stake: u64,
-    ) acquires DelegationPool {
+    ) acquires DelegationPool, BeneficiaryForOperator {
         let (actual_active, actual_inactive, actual_pending_inactive) = get_stake(pool_address, delegator_address);
         assert!(actual_active == active_stake, actual_active);
         assert!(actual_inactive == inactive_stake, actual_inactive);
@@ -2758,6 +4957,52 @@ module aptos_framework::delegation_pool {
         } else {
             assert!(0 == stake, 0);
         }
+    }
+
+    #[test_only]
+    public fun setup_vote(
+        aptos_framework: &signer,
+        validator: &signer,
+        enable_partial_voting: bool,
+    ): u64 acquires DelegationPoolOwnership, DelegationPool, GovernanceRecords, BeneficiaryForOperator, NextCommissionPercentage, DelegationPoolAllowlisting {
+        initialize_for_test_no_reward(aptos_framework);
+        aptos_governance::initialize_for_test(
+            aptos_framework,
+            (10 * ONE_APT as u128),
+            100 * ONE_APT,
+            1000,
+        );
+        aptos_governance::initialize_partial_voting(aptos_framework);
+
+        initialize_test_validator(validator, 100 * ONE_APT, true, false);
+
+        let validator_address = signer::address_of(validator);
+        let pool_address = get_owned_pool_address(validator_address);
+        // Delegation pool is created before partial governance voting feature flag is enabled. So this delegation
+        // pool's voter is its owner.
+        assert!(stake::get_delegated_voter(pool_address) == validator_address, 1);
+        assert!(!partial_governance_voting_enabled(pool_address), 1);
+        end_aptos_epoch();
+
+        // Create 1 proposals and vote for proposal1.
+        let execution_hash = vector::empty<u8>();
+        vector::push_back(&mut execution_hash, 1);
+        let proposal_id = aptos_governance::create_proposal_v2_impl(
+            validator,
+            pool_address,
+            execution_hash,
+            b"",
+            b"",
+            true,
+        );
+        if (enable_partial_voting) {
+            features::change_feature_flags_for_testing(
+                aptos_framework,
+                vector[features::get_partial_governance_voting(), features::get_delegation_pool_partial_governance_voting()],
+                vector[]);
+            enable_partial_governance_voting(pool_address);
+        };
+        proposal_id
     }
 
     #[test_only]

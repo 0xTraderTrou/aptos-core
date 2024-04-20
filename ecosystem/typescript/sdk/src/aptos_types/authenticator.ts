@@ -19,6 +19,8 @@ export abstract class TransactionAuthenticator {
         return TransactionAuthenticatorMultiEd25519.load(deserializer);
       case 2:
         return TransactionAuthenticatorMultiAgent.load(deserializer);
+      case 3:
+        return TransactionAuthenticatorFeePayer.load(deserializer);
       default:
         throw new Error(`Unknown variant index for TransactionAuthenticator: ${index}`);
     }
@@ -34,7 +36,10 @@ export class TransactionAuthenticatorEd25519 extends TransactionAuthenticator {
    * @see {@link https://aptos.dev/guides/creating-a-signed-transaction/ | Creating a Signed Transaction}
    * for details about generating a signature.
    */
-  constructor(public readonly public_key: Ed25519PublicKey, public readonly signature: Ed25519Signature) {
+  constructor(
+    public readonly public_key: Ed25519PublicKey,
+    public readonly signature: Ed25519Signature,
+  ) {
     super();
   }
 
@@ -59,7 +64,10 @@ export class TransactionAuthenticatorMultiEd25519 extends TransactionAuthenticat
    * @param signature
    *
    */
-  constructor(public readonly public_key: MultiEd25519PublicKey, public readonly signature: MultiEd25519Signature) {
+  constructor(
+    public readonly public_key: MultiEd25519PublicKey,
+    public readonly signature: MultiEd25519Signature,
+  ) {
     super();
   }
 
@@ -100,6 +108,36 @@ export class TransactionAuthenticatorMultiAgent extends TransactionAuthenticator
   }
 }
 
+export class TransactionAuthenticatorFeePayer extends TransactionAuthenticator {
+  constructor(
+    public readonly sender: AccountAuthenticator,
+    public readonly secondary_signer_addresses: Seq<AccountAddress>,
+    public readonly secondary_signers: Seq<AccountAuthenticator>,
+    public readonly fee_payer: { address: AccountAddress; authenticator: AccountAuthenticator },
+  ) {
+    super();
+  }
+
+  serialize(serializer: Serializer): void {
+    serializer.serializeU32AsUleb128(3);
+    this.sender.serialize(serializer);
+    serializeVector<AccountAddress>(this.secondary_signer_addresses, serializer);
+    serializeVector<AccountAuthenticator>(this.secondary_signers, serializer);
+    this.fee_payer.address.serialize(serializer);
+    this.fee_payer.authenticator.serialize(serializer);
+  }
+
+  static load(deserializer: Deserializer): TransactionAuthenticatorMultiAgent {
+    const sender = AccountAuthenticator.deserialize(deserializer);
+    const secondary_signer_addresses = deserializeVector(deserializer, AccountAddress);
+    const secondary_signers = deserializeVector(deserializer, AccountAuthenticator);
+    const address = AccountAddress.deserialize(deserializer);
+    const authenticator = AccountAuthenticator.deserialize(deserializer);
+    const fee_payer = { address, authenticator };
+    return new TransactionAuthenticatorFeePayer(sender, secondary_signer_addresses, secondary_signers, fee_payer);
+  }
+}
+
 export abstract class AccountAuthenticator {
   abstract serialize(serializer: Serializer): void;
 
@@ -117,7 +155,10 @@ export abstract class AccountAuthenticator {
 }
 
 export class AccountAuthenticatorEd25519 extends AccountAuthenticator {
-  constructor(public readonly public_key: Ed25519PublicKey, public readonly signature: Ed25519Signature) {
+  constructor(
+    public readonly public_key: Ed25519PublicKey,
+    public readonly signature: Ed25519Signature,
+  ) {
     super();
   }
 
@@ -135,7 +176,10 @@ export class AccountAuthenticatorEd25519 extends AccountAuthenticator {
 }
 
 export class AccountAuthenticatorMultiEd25519 extends AccountAuthenticator {
-  constructor(public readonly public_key: MultiEd25519PublicKey, public readonly signature: MultiEd25519Signature) {
+  constructor(
+    public readonly public_key: MultiEd25519PublicKey,
+    public readonly signature: MultiEd25519Signature,
+  ) {
     super();
   }
 

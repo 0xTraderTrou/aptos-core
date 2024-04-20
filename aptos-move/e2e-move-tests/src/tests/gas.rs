@@ -1,10 +1,32 @@
 // Copyright © Aptos Foundation
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{tests::common::test_dir_path, MoveHarness};
+use crate::{
+    tests::{
+        common::test_dir_path,
+        token_objects::{
+            create_mint_hero_payload, create_set_hero_description_payload,
+            publish_object_token_example,
+        },
+    },
+    MoveHarness,
+};
 use aptos_cached_packages::{aptos_stdlib, aptos_token_sdk_builder};
 use aptos_crypto::{bls12381, PrivateKey, Uniform};
-use aptos_types::account_address::{default_stake_pool_address, AccountAddress};
+use aptos_gas_profiling::TransactionGasLog;
+use aptos_types::{
+    account_address::{default_stake_pool_address, AccountAddress},
+    transaction::{EntryFunction, TransactionPayload},
+};
+use aptos_vm::AptosVM;
+use move_core_types::{identifier::Identifier, language_storage::ModuleId};
+use std::path::Path;
+
+fn save_profiling_results(name: &str, log: &TransactionGasLog) {
+    let path = Path::new("gas-profiling").join(name);
+    log.generate_html_report(path, format!("Gas Report - {}", name))
+        .unwrap();
+}
 
 /// Run with `cargo test test_gas -- --nocapture` to see output.
 #[test]
@@ -18,43 +40,108 @@ fn test_gas() {
     let account_2_address = *account_2.address();
     let account_3_address = *account_3.address();
 
-    print_gas_cost(
+    // Use the gas profiler unless explicitly disabled by the user.
+    //
+    // This is to give us some basic code coverage on the gas profile.
+    let profile_gas = match std::env::var("PROFILE_GAS") {
+        Ok(s) => {
+            let s = s.to_lowercase();
+            s != "0" && s != "false" && s != "no"
+        },
+        Err(_) => true,
+    };
+
+    let run = |harness: &mut MoveHarness, function, account, payload| {
+        if !profile_gas {
+            print_gas_cost(function, harness.evaluate_gas(account, payload));
+        } else {
+            let (log, gas_used) = harness.evaluate_gas_with_profiler(account, payload);
+            save_profiling_results(function, &log);
+            print_gas_cost(function, gas_used);
+        }
+    };
+
+    let publish = |harness: &mut MoveHarness, name, account, path: &Path| {
+        if !profile_gas {
+            print_gas_cost(name, harness.evaluate_publish_gas(account, path));
+        } else {
+            let (log, gas_used) = harness.evaluate_publish_gas_with_profiler(account, path);
+            save_profiling_results(name, &log);
+            print_gas_cost(name, gas_used);
+        }
+    };
+
+    AptosVM::set_paranoid_type_checks(true);
+
+    run(
+        &mut harness,
         "Transfer",
-        harness.evaluate_gas(
-            account_1,
-            aptos_stdlib::aptos_coin_transfer(account_2_address, 1000),
-        ),
+        account_1,
+        aptos_stdlib::aptos_coin_transfer(account_2_address, 1000),
     );
-    print_gas_cost(
+
+    run(
+        &mut harness,
+        "2ndTransfer",
+        account_1,
+        aptos_stdlib::aptos_coin_transfer(account_2_address, 1000),
+    );
+
+    run(
+        &mut harness,
         "CreateAccount",
-        harness.evaluate_gas(
-            account_1,
-            aptos_stdlib::aptos_account_create_account(
-                AccountAddress::from_hex_literal("0xcafe1").unwrap(),
-            ),
+        account_1,
+        aptos_stdlib::aptos_account_create_account(
+            AccountAddress::from_hex_literal("0xcafe1").unwrap(),
         ),
     );
-    print_gas_cost(
+    run(
+        &mut harness,
         "CreateTransfer",
-        harness.evaluate_gas(
-            account_1,
-            aptos_stdlib::aptos_account_transfer(
-                AccountAddress::from_hex_literal("0xcafe2").unwrap(),
-                1000,
-            ),
+        account_1,
+        aptos_stdlib::aptos_account_transfer(
+            AccountAddress::from_hex_literal("0xcafe2").unwrap(),
+            1000,
         ),
     );
-    print_gas_cost(
+
+    publish_object_token_example(&mut harness, account_1_address, account_1);
+    run(
+        &mut harness,
+        "MintTokenV2",
+        account_1,
+        create_mint_hero_payload(&account_1_address, SHORT_STR),
+    );
+    run(
+        &mut harness,
+        "MutateTokenV2",
+        account_1,
+        create_set_hero_description_payload(&account_1_address, SHORT_STR),
+    );
+    publish_object_token_example(&mut harness, account_2_address, account_2);
+    run(
+        &mut harness,
+        "MintLargeTokenV2",
+        account_2,
+        create_mint_hero_payload(&account_2_address, LONG_STR),
+    );
+    run(
+        &mut harness,
+        "MutateLargeTokenV2",
+        account_2,
+        create_set_hero_description_payload(&account_2_address, LONG_STR),
+    );
+
+    run(
+        &mut harness,
         "CreateStakePool",
-        harness.evaluate_gas(
-            account_1,
-            aptos_stdlib::staking_contract_create_staking_contract(
-                account_2_address,
-                account_3_address,
-                25_000_000,
-                10,
-                vec![],
-            ),
+        account_1,
+        aptos_stdlib::staking_contract_create_staking_contract(
+            account_2_address,
+            account_3_address,
+            25_000_000,
+            10,
+            vec![],
         ),
     );
     let pool_address = default_stake_pool_address(account_1_address, account_2_address);
@@ -63,134 +150,123 @@ fn test_gas() {
     let proof_of_possession = bls12381::ProofOfPossession::create(&consensus_key)
         .to_bytes()
         .to_vec();
-    print_gas_cost(
+    run(
+        &mut harness,
         "RotateConsensusKey",
-        harness.evaluate_gas(
-            account_2,
-            aptos_stdlib::stake_rotate_consensus_key(
-                pool_address,
-                consensus_pubkey,
-                proof_of_possession,
-            ),
+        account_2,
+        aptos_stdlib::stake_rotate_consensus_key(
+            pool_address,
+            consensus_pubkey,
+            proof_of_possession,
         ),
     );
-    print_gas_cost(
+    run(
+        &mut harness,
         "JoinValidator100",
-        harness.evaluate_gas(
-            account_2,
-            aptos_stdlib::stake_join_validator_set(pool_address),
-        ),
+        account_2,
+        aptos_stdlib::stake_join_validator_set(pool_address),
     );
-    print_gas_cost(
+    run(
+        &mut harness,
         "AddStake",
-        harness.evaluate_gas(
-            account_1,
-            aptos_stdlib::staking_contract_add_stake(account_2_address, 1000),
-        ),
+        account_1,
+        aptos_stdlib::staking_contract_add_stake(account_2_address, 1000),
     );
-    print_gas_cost(
+    run(
+        &mut harness,
         "UnlockStake",
-        harness.evaluate_gas(
-            account_1,
-            aptos_stdlib::staking_contract_unlock_stake(account_2_address, 1000),
-        ),
+        account_1,
+        aptos_stdlib::staking_contract_unlock_stake(account_2_address, 1000),
     );
     harness.fast_forward(7200);
     harness.new_epoch();
-    print_gas_cost(
+    run(
+        &mut harness,
         "WithdrawStake",
-        harness.evaluate_gas(
-            account_1,
-            aptos_stdlib::staking_contract_distribute(account_1_address, account_2_address),
-        ),
+        account_1,
+        aptos_stdlib::staking_contract_distribute(account_1_address, account_2_address),
     );
-    print_gas_cost(
+    run(
+        &mut harness,
         "LeaveValidatorSet100",
-        harness.evaluate_gas(
-            account_2,
-            aptos_stdlib::stake_leave_validator_set(pool_address),
-        ),
+        account_2,
+        aptos_stdlib::stake_leave_validator_set(pool_address),
     );
     let collection_name = "collection name".to_owned().into_bytes();
     let token_name = "token name".to_owned().into_bytes();
-    print_gas_cost(
+    run(
+        &mut harness,
         "CreateCollection",
-        harness.evaluate_gas(
-            account_1,
-            aptos_token_sdk_builder::token_create_collection_script(
-                collection_name.clone(),
-                "description".to_owned().into_bytes(),
-                "uri".to_owned().into_bytes(),
-                20_000_000,
-                vec![false, false, false],
-            ),
+        account_1,
+        aptos_token_sdk_builder::token_create_collection_script(
+            collection_name.clone(),
+            "description".to_owned().into_bytes(),
+            "uri".to_owned().into_bytes(),
+            20_000_000,
+            vec![false, false, false],
         ),
     );
-    print_gas_cost(
+    run(
+        &mut harness,
         "CreateTokenFirstTime",
-        harness.evaluate_gas(
-            account_1,
-            aptos_token_sdk_builder::token_create_token_script(
-                collection_name.clone(),
-                token_name.clone(),
-                "collection description".to_owned().into_bytes(),
-                1,
-                4,
-                "uri".to_owned().into_bytes(),
-                account_1_address,
-                1,
-                0,
-                vec![false, false, false, false, true],
-                vec!["age".as_bytes().to_vec()],
-                vec!["3".as_bytes().to_vec()],
-                vec!["int".as_bytes().to_vec()],
-            ),
+        account_1,
+        aptos_token_sdk_builder::token_create_token_script(
+            collection_name.clone(),
+            token_name.clone(),
+            "collection description".to_owned().into_bytes(),
+            1,
+            4,
+            "uri".to_owned().into_bytes(),
+            account_1_address,
+            1,
+            0,
+            vec![false, false, false, false, true],
+            vec!["age".as_bytes().to_vec()],
+            vec!["3".as_bytes().to_vec()],
+            vec!["int".as_bytes().to_vec()],
         ),
     );
-    print_gas_cost(
-        "MintToken",
-        harness.evaluate_gas(
-            account_1,
-            aptos_token_sdk_builder::token_mint_script(
-                account_1_address,
-                collection_name.clone(),
-                token_name.clone(),
-                1,
-            ),
+    run(
+        &mut harness,
+        "MintTokenV1",
+        account_1,
+        aptos_token_sdk_builder::token_mint_script(
+            account_1_address,
+            collection_name.clone(),
+            token_name.clone(),
+            1,
         ),
     );
-    print_gas_cost(
-        "MutateToken",
-        harness.evaluate_gas(
-            account_1,
-            aptos_token_sdk_builder::token_mutate_token_properties(
-                account_1_address,
-                account_1_address,
-                collection_name.clone(),
-                token_name.clone(),
-                0,
-                1,
-                vec!["age".as_bytes().to_vec()],
-                vec!["4".as_bytes().to_vec()],
-                vec!["int".as_bytes().to_vec()],
-            ),
+    run(
+        &mut harness,
+        "MutateTokenV1",
+        account_1,
+        aptos_token_sdk_builder::token_mutate_token_properties(
+            account_1_address,
+            account_1_address,
+            collection_name.clone(),
+            token_name.clone(),
+            0,
+            1,
+            vec!["age".as_bytes().to_vec()],
+            vec!["4".as_bytes().to_vec()],
+            vec!["int".as_bytes().to_vec()],
         ),
     );
-    print_gas_cost(
-        "MutateToken2ndTime",
-        harness.evaluate_gas(
-            account_1,
-            aptos_token_sdk_builder::token_mutate_token_properties(
-                account_1_address,
-                account_1_address,
-                collection_name.clone(),
-                token_name.clone(),
-                1,
-                1,
-                vec!["age".as_bytes().to_vec()],
-                vec!["5".as_bytes().to_vec()],
-                vec!["int".as_bytes().to_vec()],
-            ),
+    run(
+        &mut harness,
+        "MutateTokenV12ndTime",
+        account_1,
+        aptos_token_sdk_builder::token_mutate_token_properties(
+            account_1_address,
+            account_1_address,
+            collection_name.clone(),
+            token_name.clone(),
+            1,
+            1,
+            vec!["age".as_bytes().to_vec()],
+            vec!["5".as_bytes().to_vec()],
+            vec!["int".as_bytes().to_vec()],
         ),
     );
 
@@ -202,74 +278,133 @@ fn test_gas() {
         vals.push(format!("{}", i).as_bytes().to_vec());
         typs.push("u64".as_bytes().to_vec());
     }
-    print_gas_cost(
+    run(
+        &mut harness,
         "MutateTokenAdd10NewProperties",
-        harness.evaluate_gas(
-            account_1,
-            aptos_token_sdk_builder::token_mutate_token_properties(
-                account_1_address,
-                account_1_address,
-                collection_name.clone(),
-                token_name.clone(),
-                1,
-                1,
-                keys.clone(),
-                vals.clone(),
-                typs.clone(),
-            ),
+        account_1,
+        aptos_token_sdk_builder::token_mutate_token_properties(
+            account_1_address,
+            account_1_address,
+            collection_name.clone(),
+            token_name.clone(),
+            1,
+            1,
+            keys.clone(),
+            vals.clone(),
+            typs.clone(),
         ),
     );
-    print_gas_cost(
+    run(
+        &mut harness,
         "MutateTokenMutate10ExistingProperties",
-        harness.evaluate_gas(
-            account_1,
-            aptos_token_sdk_builder::token_mutate_token_properties(
-                account_1_address,
-                account_1_address,
-                collection_name,
-                token_name,
-                1,
-                1,
-                keys,
-                vals,
-                typs,
-            ),
+        account_1,
+        aptos_token_sdk_builder::token_mutate_token_properties(
+            account_1_address,
+            account_1_address,
+            collection_name,
+            token_name,
+            1,
+            1,
+            keys,
+            vals,
+            typs,
         ),
     );
 
     let publisher = &harness.new_account_at(AccountAddress::from_hex_literal("0xcafe").unwrap());
-    print_gas_cost(
+    publish(
+        &mut harness,
         "PublishSmall",
-        harness.evaluate_publish_gas(
-            publisher,
-            &test_dir_path("code_publishing.data/pack_initial"),
-        ),
+        publisher,
+        &test_dir_path("code_publishing.data/pack_initial"),
     );
-    print_gas_cost(
+    publish(
+        &mut harness,
         "UpgradeSmall",
-        harness.evaluate_publish_gas(
-            publisher,
-            &test_dir_path("code_publishing.data/pack_upgrade_compat"),
-        ),
+        publisher,
+        &test_dir_path("code_publishing.data/pack_upgrade_compat"),
     );
-    let publisher = &harness.aptos_framework_account();
-    print_gas_cost(
+    publish(
+        &mut harness,
         "PublishLarge",
-        harness.evaluate_publish_gas(
-            publisher,
-            &test_dir_path("code_publishing.data/pack_stdlib"),
-        ),
+        publisher,
+        &test_dir_path("code_publishing.data/pack_large"),
+    );
+    publish(
+        &mut harness,
+        "UpgradeLarge",
+        publisher,
+        &test_dir_path("code_publishing.data/pack_large_upgrade"),
+    );
+    publish(
+        &mut harness,
+        "PublishDependencyChain-1",
+        publisher,
+        &test_dir_path("dependencies.data/p1"),
+    );
+    publish(
+        &mut harness,
+        "PublishDependencyChain-2",
+        publisher,
+        &test_dir_path("dependencies.data/p2"),
+    );
+    publish(
+        &mut harness,
+        "PublishDependencyChain-3",
+        publisher,
+        &test_dir_path("dependencies.data/p3"),
+    );
+    run(
+        &mut harness,
+        "UseDependencyChain-1",
+        publisher,
+        TransactionPayload::EntryFunction(EntryFunction::new(
+            ModuleId::new(
+                AccountAddress::from_hex_literal("0xcafe").unwrap(),
+                Identifier::new("m1").unwrap(),
+            ),
+            Identifier::new("run").unwrap(),
+            vec![],
+            vec![],
+        )),
+    );
+    run(
+        &mut harness,
+        "UseDependencyChain-2",
+        publisher,
+        TransactionPayload::EntryFunction(EntryFunction::new(
+            ModuleId::new(
+                AccountAddress::from_hex_literal("0xcafe").unwrap(),
+                Identifier::new("m2").unwrap(),
+            ),
+            Identifier::new("run").unwrap(),
+            vec![],
+            vec![],
+        )),
+    );
+    run(
+        &mut harness,
+        "UseDependencyChain-3",
+        publisher,
+        TransactionPayload::EntryFunction(EntryFunction::new(
+            ModuleId::new(
+                AccountAddress::from_hex_literal("0xcafe").unwrap(),
+                Identifier::new("m3").unwrap(),
+            ),
+            Identifier::new("run").unwrap(),
+            vec![],
+            vec![],
+        )),
     );
 }
 
 fn dollar_cost(gas_units: u64, price: u64) -> f64 {
-    (gas_units as f64) / 100_000_000_f64 * (price as f64)
+    ((gas_units * 100/* gas unit price */) as f64) / 100_000_000_f64 * (price as f64)
 }
 
 pub fn print_gas_cost(function: &str, gas_units: u64) {
-    let gas_units = gas_units * 100;
     println!(
-        "{:20} | {:8} | {:.3} | {:.3} | {:.3}",
+        "{:20} | {:8} | {:.6} | {:.6} | {:.6}",
         function,
         gas_units,
         dollar_cost(gas_units, 5),
@@ -277,3 +412,39 @@ pub fn print_gas_cost(function: &str, gas_units: u64) {
         dollar_cost(gas_units, 30)
     );
 }
+
+const SHORT_STR: &str = "A hero.";
+const LONG_STR: &str = "\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+    ";

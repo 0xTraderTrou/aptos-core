@@ -7,7 +7,8 @@ use crate::{
 };
 use aptos_crypto::ValidCryptoMaterialStringExt;
 use aptos_forge::Swarm;
-use aptos_gas::{AptosGasParameters, GasQuantity, InitialGasSchedule, ToOnChainGasSchedule};
+use aptos_gas_algebra::GasQuantity;
+use aptos_gas_schedule::{AptosGasParameters, InitialGasSchedule, ToOnChainGasSchedule};
 use aptos_release_builder::{
     components::{
         feature_flags::{FeatureFlag, Features},
@@ -18,7 +19,7 @@ use aptos_release_builder::{
     ReleaseEntry,
 };
 use aptos_temppath::TempPath;
-use aptos_types::on_chain_config::OnChainConsensusConfig;
+use aptos_types::on_chain_config::{FeatureFlag as AptosFeatureFlag, OnChainConsensusConfig};
 use std::{fs, path::PathBuf, process::Command, sync::Arc};
 
 // Ignored. This is redundant with the forge compat test but this test is easier to run locally and
@@ -49,15 +50,16 @@ async fn test_upgrade_flow() {
     // Bump the limit in gas schedule
     // TODO: Replace this logic with aptos-gas
     let mut gas_parameters = AptosGasParameters::initial();
-    gas_parameters.txn.max_transaction_size_in_bytes = GasQuantity::new(100_000_000);
+    gas_parameters.vm.txn.max_transaction_size_in_bytes = GasQuantity::new(100_000_000);
 
     let gas_schedule = aptos_types::on_chain_config::GasScheduleV2 {
-        feature_version: aptos_gas::LATEST_GAS_FEATURE_VERSION,
-        entries: gas_parameters.to_on_chain_gas_schedule(aptos_gas::LATEST_GAS_FEATURE_VERSION),
+        feature_version: aptos_gas_schedule::LATEST_GAS_FEATURE_VERSION,
+        entries: gas_parameters
+            .to_on_chain_gas_schedule(aptos_gas_schedule::LATEST_GAS_FEATURE_VERSION),
     };
 
     let (_, update_gas_script) =
-        generate_gas_upgrade_proposal(&gas_schedule, true, "".to_owned().into_bytes())
+        generate_gas_upgrade_proposal(true, &gas_schedule, true, "".to_owned().into_bytes())
             .unwrap()
             .pop()
             .unwrap();
@@ -95,7 +97,9 @@ async fn test_upgrade_flow() {
         .unwrap()
         .status
         .success());
-    *env.aptos_public_info().root_account().sequence_number_mut() += 1;
+    env.aptos_public_info()
+        .root_account()
+        .increment_sequence_number();
 
     let upgrade_scripts_folder = TempPath::new();
     upgrade_scripts_folder.create_as_dir().unwrap();
@@ -125,7 +129,7 @@ async fn test_upgrade_flow() {
                 metadata: ProposalMetadata::default(),
                 update_sequence: vec![
                     ReleaseEntry::FeatureFlag(Features {
-                        enabled: aptos_vm_genesis::default_features()
+                        enabled: AptosFeatureFlag::default_features()
                             .into_iter()
                             .map(FeatureFlag::from)
                             .collect(),
@@ -187,7 +191,9 @@ async fn test_upgrade_flow() {
             .status
             .success());
 
-        *env.aptos_public_info().root_account().sequence_number_mut() += 1;
+        env.aptos_public_info()
+            .root_account()
+            .increment_sequence_number();
     }
 
     //TODO: Make sure gas schedule is indeed updated by the tool.
@@ -211,7 +217,7 @@ async fn test_upgrade_flow() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_release_validate_tool_multi_step() {
     let (mut env, _, _) = SwarmBuilder::new_local(1)
-        .with_init_config(Arc::new(|_, _, genesis_stake_amount| {
+        .with_init_genesis_stake(Arc::new(|_, genesis_stake_amount| {
             // make sure we have quorum
             *genesis_stake_amount = 2000000000000000;
         }))
@@ -259,7 +265,7 @@ async fn test_release_validate_tool_multi_step() {
 
     let root_account = env.aptos_public_info().root_account().address();
     // Test the module publishing workflow
-    *env.aptos_public_info().root_account().sequence_number_mut() = env
+    let sequence_number = env
         .aptos_public_info()
         .client()
         .get_account(root_account)
@@ -267,6 +273,9 @@ async fn test_release_validate_tool_multi_step() {
         .unwrap()
         .inner()
         .sequence_number;
+    env.aptos_public_info()
+        .root_account()
+        .set_sequence_number(sequence_number);
 
     let base_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let base_path_v1 = base_dir.join("src/aptos/package_publish_modules_v1/");

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #![allow(clippy::unit_arg)]
+#![allow(clippy::arc_with_non_send_sync)]
 
 use crate::language_storage::ModuleId;
 use anyhow::Result;
@@ -57,7 +58,11 @@ pub enum VMStatus {
     /// Indicates an error from the VM, e.g. OUT_OF_GAS, INVALID_AUTH_KEY, RET_TYPE_MISMATCH_ERROR
     /// etc.
     /// The code will neither EXECUTED nor ABORTED
-    Error(StatusCode, Option<String>),
+    Error {
+        status_code: StatusCode,
+        sub_status: Option<u64>,
+        message: Option<String>,
+    },
 
     /// Indicates an `abort` from inside Move code. Contains the location of the abort and the code
     MoveAbort(AbortLocation, /* code */ u64),
@@ -66,6 +71,7 @@ pub enum VMStatus {
     /// dividing by zero or a missing resource
     ExecutionFailure {
         status_code: StatusCode,
+        sub_status: Option<u64>,
         location: AbortLocation,
         function: u16,
         code_offset: u16,
@@ -89,6 +95,7 @@ pub enum KeptVMStatus {
         location: AbortLocation,
         function: u16,
         code_offset: u16,
+        message: Option<String>,
     },
     MiscellaneousError,
 }
@@ -126,13 +133,23 @@ pub enum StatusType {
 }
 
 impl VMStatus {
+    pub fn error(status_code: StatusCode, message: Option<String>) -> Self {
+        Self::Error {
+            status_code,
+            sub_status: None,
+            message,
+        }
+    }
+
     /// Return the status code for the `VMStatus`
     pub fn status_code(&self) -> StatusCode {
         match self {
             Self::Executed => StatusCode::EXECUTED,
             Self::MoveAbort(_, _) => StatusCode::ABORTED,
             Self::ExecutionFailure { status_code, .. } => *status_code,
-            Self::Error(code, _) => {
+            Self::Error {
+                status_code: code, ..
+            } => {
                 let code = *code;
                 debug_assert!(code != StatusCode::EXECUTED);
                 debug_assert!(code != StatusCode::ABORTED);
@@ -141,10 +158,21 @@ impl VMStatus {
         }
     }
 
+    pub fn sub_status(&self) -> Option<u64> {
+        match self {
+            Self::Error { sub_status, .. } | Self::ExecutionFailure { sub_status, .. } => {
+                *sub_status
+            },
+            Self::Executed | Self::MoveAbort(..) => None,
+        }
+    }
+
     /// Returns the message associated with the `VMStatus`, if any.
     pub fn message(&self) -> Option<&String> {
         match self {
-            Self::Error(_, message) | Self::ExecutionFailure { message, .. } => message.as_ref(),
+            Self::Error { message, .. } | Self::ExecutionFailure { message, .. } => {
+                message.as_ref()
+            },
             _ => None,
         }
     }
@@ -153,7 +181,7 @@ impl VMStatus {
     pub fn move_abort_code(&self) -> Option<u64> {
         match self {
             Self::MoveAbort(_, code) => Some(*code),
-            Self::Error(..) | Self::ExecutionFailure { .. } | Self::Executed => None,
+            Self::Error { .. } | Self::ExecutionFailure { .. } | Self::Executed => None,
         }
     }
 
@@ -172,34 +200,46 @@ impl VMStatus {
                 status_code: StatusCode::OUT_OF_GAS,
                 ..
             }
-            | VMStatus::Error(StatusCode::OUT_OF_GAS, _) => Ok(KeptVMStatus::OutOfGas),
+            | VMStatus::Error {
+                status_code: StatusCode::OUT_OF_GAS,
+                ..
+            } => Ok(KeptVMStatus::OutOfGas),
 
             VMStatus::ExecutionFailure {
                 status_code:
                     StatusCode::EXECUTION_LIMIT_REACHED
                     | StatusCode::IO_LIMIT_REACHED
-                    | StatusCode::STORAGE_LIMIT_REACHED,
+                    | StatusCode::STORAGE_LIMIT_REACHED
+                    | StatusCode::TOO_MANY_DELAYED_FIELDS,
                 ..
             }
-            | VMStatus::Error(
-                StatusCode::EXECUTION_LIMIT_REACHED
-                | StatusCode::IO_LIMIT_REACHED
-                | StatusCode::STORAGE_LIMIT_REACHED,
-                _,
-            ) => Ok(KeptVMStatus::MiscellaneousError),
+            | VMStatus::Error {
+                status_code:
+                    StatusCode::EXECUTION_LIMIT_REACHED
+                    | StatusCode::IO_LIMIT_REACHED
+                    | StatusCode::STORAGE_LIMIT_REACHED
+                    | StatusCode::TOO_MANY_DELAYED_FIELDS,
+                ..
+            } => Ok(KeptVMStatus::MiscellaneousError),
 
             VMStatus::ExecutionFailure {
                 status_code: _status_code,
                 location,
                 function,
                 code_offset,
+                message,
                 ..
             } => Ok(KeptVMStatus::ExecutionFailure {
                 location,
                 function,
                 code_offset,
+                message,
             }),
-            VMStatus::Error(code, _) => {
+            VMStatus::Error {
+                status_code: code,
+                message,
+                ..
+            } => {
                 match code.status_type() {
                     // Any unknown error should be discarded
                     StatusType::Unknown => Err(code),
@@ -220,6 +260,7 @@ impl VMStatus {
                         location: AbortLocation::Script,
                         function: 0,
                         code_offset: 0,
+                        message,
                     }),
                 }
             },
@@ -250,6 +291,10 @@ impl fmt::Display for VMStatus {
             status = format!("{} with sub status {}", status, code);
         }
 
+        if let Some(msg) = self.message() {
+            status = format!("{} with message {}", status, msg);
+        }
+
         write!(f, "{}", status)
     }
 }
@@ -268,10 +313,11 @@ impl fmt::Display for KeptVMStatus {
                 location,
                 function,
                 code_offset,
+                message,
             } => write!(
                 f,
-                "EXECUTION_FAILURE at bytecode offset {} in function index {} in {}",
-                code_offset, function, location
+                "EXECUTION_FAILURE at bytecode offset {} in function index {} in {} with error message {:?}",
+                code_offset, function, location, message
             ),
         }
     }
@@ -281,10 +327,15 @@ impl fmt::Debug for VMStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             VMStatus::Executed => write!(f, "EXECUTED"),
-            VMStatus::Error(code, msg) => f
+            VMStatus::Error {
+                status_code,
+                sub_status,
+                message,
+            } => f
                 .debug_struct("ERROR")
-                .field("status_code", code)
-                .field("message", msg)
+                .field("status_code", status_code)
+                .field("sub_status", sub_status)
+                .field("message", message)
                 .finish(),
             VMStatus::MoveAbort(location, code) => f
                 .debug_struct("ABORTED")
@@ -297,9 +348,11 @@ impl fmt::Debug for VMStatus {
                 function,
                 code_offset,
                 message,
+                sub_status,
             } => f
                 .debug_struct("EXECUTION_FAILURE")
                 .field("status_code", status_code)
+                .field("sub_status", sub_status)
                 .field("location", location)
                 .field("function_definition", function)
                 .field("code_offset", code_offset)
@@ -323,11 +376,13 @@ impl fmt::Debug for KeptVMStatus {
                 location,
                 function,
                 code_offset,
+                message,
             } => f
                 .debug_struct("EXECUTION_FAILURE")
                 .field("location", location)
                 .field("function_definition", function)
                 .field("code_offset", code_offset)
+                .field("message", message)
                 .finish(),
             KeptVMStatus::MiscellaneousError => write!(f, "MISCELLANEOUS_ERROR"),
         }
@@ -461,7 +516,8 @@ pub enum StatusCode {
     SEQUENCE_NUMBER_TOO_OLD = 3,
     // Sequence number is too new
     SEQUENCE_NUMBER_TOO_NEW = 4,
-    // Insufficient balance to pay minimum transaction fee
+    // Insufficient balance to pay for max_gas specified in the transaction.
+    // Balance needs to be above max_gas_amount * gas_unit_price to proceed.
     INSUFFICIENT_BALANCE_FOR_TRANSACTION_FEE = 5,
     // The transaction has expired
     TRANSACTION_EXPIRED = 6,
@@ -526,12 +582,14 @@ pub enum StatusCode {
     MULTISIG_TRANSACTION_NOT_FOUND = 33,
     MULTISIG_TRANSACTION_INSUFFICIENT_APPROVALS = 34,
     MULTISIG_TRANSACTION_PAYLOAD_DOES_NOT_MATCH_HASH = 35,
+    GAS_PAYER_ACCOUNT_MISSING = 36,
+    INSUFFICIENT_BALANCE_FOR_REQUIRED_DEPOSIT = 37,
+    GAS_PARAMS_MISSING = 38,
     // Reserved error code for future use
-    RESERVED_VALIDATION_ERROR_1 = 36,
-    RESERVED_VALIDATION_ERROR_2 = 37,
-    RESERVED_VALIDATION_ERROR_3 = 38,
     RESERVED_VALIDATION_ERROR_4 = 39,
     RESERVED_VALIDATION_ERROR_5 = 40,
+    RESERVED_VALIDATION_ERROR_6 = 41,
+    RESERVED_VALIDATION_ERROR_7 = 42,
 
     // When a code module/script is published it is verified. These are the
     // possible errors that can arise from the verification process.
@@ -656,13 +714,16 @@ pub enum StatusCode {
     MAX_FUNCTION_DEFINITIONS_REACHED = 1119,
     MAX_STRUCT_DEFINITIONS_REACHED = 1120,
     MAX_FIELD_DEFINITIONS_REACHED = 1121,
-    // Reserved error code for future use
     TOO_MANY_BACK_EDGES = 1122,
-    RESERVED_VERIFICATION_ERROR_1 = 1123,
-    RESERVED_VERIFICATION_ERROR_2 = 1124,
-    RESERVED_VERIFICATION_ERROR_3 = 1125,
-    RESERVED_VERIFICATION_ERROR_4 = 1126,
-    RESERVED_VERIFICATION_ERROR_5 = 1127,
+    EVENT_METADATA_VALIDATION_ERROR = 1123,
+    DEPENDENCY_LIMIT_REACHED = 1124,
+    // This error indicates that unstable bytecode generated by the compiler cannot be published to mainnet
+    UNSTABLE_BYTECODE_REJECTED = 1125,
+    // Reserved error code for future use
+    RESERVED_VERIFICATION_ERROR_2 = 1126,
+    RESERVED_VERIFICATION_ERROR_3 = 1127,
+    RESERVED_VERIFICATION_ERROR_4 = 1128,
+    RESERVED_VERIFICATION_ERROR_5 = 1129,
 
     // These are errors that the VM might raise if a violation of internal
     // invariants takes place.
@@ -685,15 +746,28 @@ pub enum StatusCode {
     // Failed to resolve type due to linking being broken after verification
     TYPE_RESOLUTION_FAILURE = 2021,
     DUPLICATE_NATIVE_FUNCTION = 2022,
+    // code invariant error while handling delayed materialization, should never happen,
+    // always indicates a code bug.
+    // Delayed materialization includes handling of Resource Groups and Delayed Fields.
+    // Unlike regular CODE_INVARIANT_ERROR, this is a signal to BlockSTM,
+    // which it might do something about (i.e. fallback to sequential execution)
+    DELAYED_MATERIALIZATION_CODE_INVARIANT_ERROR = 2023,
+    // Speculative error means that there was an issue because of speculative
+    // reads provided to the transaction, and the transaction needs to
+    // be re-executed.
+    // Should never be committed on chain
+    SPECULATIVE_EXECUTION_ABORT_ERROR = 2024,
+    ACCESS_CONTROL_INVARIANT_VIOLATION = 2025,
+
     // Reserved error code for future use
-    RESERVED_INVARIANT_VIOLATION_ERROR_1 = 2023,
-    RESERVED_INVARIANT_VIOLATION_ERROR_2 = 2024,
-    RESERVED_INVARIANT_VIOLATION_ERROR_3 = 2025,
-    RESERVED_INVARIANT_VIOLATION_ERROR_4 = 2026,
-    RESERVED_INVARIANT_VIOLATION_ERROR_5 = 2027,
+    RESERVED_INVARIANT_VIOLATION_ERROR_1 = 2026,
+    RESERVED_INVARIANT_VIOLATION_ERROR_2 = 2027,
+    RESERVED_INVARIANT_VIOLATION_ERROR_3 = 2028,
+    RESERVED_INVARIANT_VIOLATION_ERROR_4 = 2039,
+    RESERVED_INVARIANT_VIOLATION_ERROR_5 = 2040,
 
     // Errors that can arise from binary decoding (deserialization)
-    // Deserializtion Errors: 3000-3999
+    // Deserialization Errors: 3000-3999
     UNKNOWN_BINARY_ERROR = 3000,
     MALFORMED = 3001,
     BAD_MAGIC = 3002,
@@ -749,12 +823,20 @@ pub enum StatusCode {
     EXECUTION_LIMIT_REACHED = 4030,
     IO_LIMIT_REACHED = 4031,
     STORAGE_LIMIT_REACHED = 4032,
-    // Reserved error code for future use
-    RESERVED_RUNTIME_ERROR_1 = 4033,
-    RESERVED_RUNTIME_ERROR_2 = 4034,
-    RESERVED_RUNTIME_ERROR_3 = 4035,
-    RESERVED_RUNTIME_ERROR_4 = 4036,
-    RESERVED_RUNTIME_ERROR_5 = 4037,
+    TYPE_TAG_LIMIT_EXCEEDED = 4033,
+    // A resource was accessed in a way which is not permitted by the active access control
+    // specifier.
+    ACCESS_DENIED = 4034,
+    // The stack of access control specifier has overflowed.
+    ACCESS_STACK_LIMIT_EXCEEDED = 4035,
+    // We tried to create resource with more than currently allowed number of DelayedFields
+    TOO_MANY_DELAYED_FIELDS = 4036,
+
+    // Reserved error code for future use. Always keep this buffer of well-defined new codes.
+    RESERVED_RUNTIME_ERROR_1 = 4037,
+    RESERVED_RUNTIME_ERROR_2 = 4038,
+    RESERVED_RUNTIME_ERROR_3 = 4039,
+    RESERVED_RUNTIME_ERROR_4 = 4040,
 
     // A reserved status to represent an unknown vm status.
     // this is std::u64::MAX, but we can't pattern match on that, so put the hardcoded value in
@@ -841,13 +923,6 @@ impl From<StatusCode> for u64 {
     }
 }
 
-pub mod sub_status {
-    // Native Function Error sub-codes
-    pub const NFE_VECTOR_ERROR_BASE: u64 = 0;
-    // Failure in BCS deserialization
-    pub const NFE_BCS_SERIALIZATION_FAILURE: u64 = 0x1C5;
-}
-
 /// The `Arbitrary` impl only generates validation statuses since the full enum is too large.
 #[cfg(any(test, feature = "fuzzing"))]
 impl Arbitrary for StatusCode {
@@ -900,5 +975,25 @@ fn test_status_codes() {
         seen_statuses.insert(unwrapped_status);
         let to_major_status_code = u64::from(unwrapped_status);
         assert_eq!(*major_status_code, to_major_status_code);
+    }
+}
+
+pub mod sub_status {
+    // Native Function Error sub-codes
+    pub const NFE_VECTOR_ERROR_BASE: u64 = 0;
+    // Failure in BCS deserialization
+    pub const NFE_BCS_SERIALIZATION_FAILURE: u64 = 0x1C5;
+
+    pub mod unknown_invariant_violation {
+        // Paranoid Type checking returns an error
+        pub const EPARANOID_FAILURE: u64 = 0x1;
+
+        // Reference safety checks failure
+        pub const EREFERENCE_COUNTING_FAILURE: u64 = 0x2;
+    }
+
+    pub mod type_resolution_failure {
+        // User provided typetag failed to load.
+        pub const EUSER_TYPE_LOADING_FAILURE: u64 = 0x1;
     }
 }

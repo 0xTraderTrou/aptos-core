@@ -1,6 +1,7 @@
 // Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::VerifierConfig;
 use move_binary_format::{
     binary_views::BinaryIndexedView,
     errors::{Location, PartialVMError, PartialVMResult, VMResult},
@@ -854,7 +855,7 @@ impl<'a, const N: usize> SignatureChecker<'a, N> {
             .map(|idx| (idx as TypeParameterIndex, AbilitySet::ALL))
             .collect::<BitsetTypeParameterConstraints<N>>();
 
-        for (_field_offset, field_def) in fields.iter().enumerate() {
+        for field_def in fields.iter() {
             let field_ty = &field_def.signature.0;
 
             // Check if the field type itself is well-formed.
@@ -992,8 +993,11 @@ pub fn verify_module(module: &CompiledModule) -> VMResult<()> {
     res.map_err(|e| e.finish(Location::Module(module.self_id())))
 }
 
-pub fn verify_script(script: &CompiledScript) -> VMResult<()> {
-    let max_num = max_num_of_ty_params_or_args(BinaryIndexedView::Script(script));
+pub fn verify_script(config: &VerifierConfig, script: &CompiledScript) -> VMResult<()> {
+    let mut max_num = max_num_of_ty_params_or_args(BinaryIndexedView::Script(script));
+    if config.sig_checker_v2_fix_script_ty_param_count {
+        max_num = max_num.max(script.type_parameters.len());
+    }
 
     let res = if max_num <= NUM_PARAMS_PER_WORD {
         verify_script_impl::<1>(script)

@@ -139,6 +139,8 @@ module aptos_framework::genesis {
         stake::store_aptos_coin_mint_cap(aptos_framework, mint_cap);
         // Give transaction_fee module BurnCapability<AptosCoin> so it can burn gas.
         transaction_fee::store_aptos_coin_burn_cap(aptos_framework, burn_cap);
+        // Give transaction_fee module MintCapability<AptosCoin> so it can mint refunds.
+        transaction_fee::store_aptos_coin_mint_cap(aptos_framework, mint_cap);
     }
 
     /// Only called for testnets and e2e tests.
@@ -151,6 +153,8 @@ module aptos_framework::genesis {
         stake::store_aptos_coin_mint_cap(aptos_framework, mint_cap);
         // Give transaction_fee module BurnCapability<AptosCoin> so it can burn gas.
         transaction_fee::store_aptos_coin_burn_cap(aptos_framework, burn_cap);
+        // Give transaction_fee module MintCapability<AptosCoin> so it can mint refunds.
+        transaction_fee::store_aptos_coin_mint_cap(aptos_framework, mint_cap);
 
         let core_resources = account::create_account(@core_resources);
         account::rotate_authentication_key_internal(&core_resources, core_resources_auth_key);
@@ -418,7 +422,7 @@ module aptos_framework::genesis {
             rewards_rate_denominator,
             voting_power_increase_limit
         );
-        features::change_feature_flags(aptos_framework, vector[1, 2], vector[]);
+        features::change_feature_flags_for_verification(aptos_framework, vector[1, 2], vector[]);
         initialize_aptos_coin(aptos_framework);
         aptos_governance::initialize_for_verification(
             aptos_framework,

@@ -76,6 +76,10 @@ aptos-move/move-examples/scripts/minter/build/Minter/*
 # Docker incremental build temporary files and directories
 target-out-docker
 **/Dockerfile.tmp
+# Indexer grpc temporary certificates.
+docker/compose/indexer-grpc/data-service-grpc-server.crt
+docker/compose/indexer-grpc/data-service-grpc-server.key
+
 
 # Doc generation output
 *.md.old
@@ -90,8 +94,9 @@ target-out-docker
 .*\#
 \#*\#
 
-# Aptos CLI files
+# Aptos CLI / local testnet files
 .aptos
+**/*.rdb
 
 # VSCode settings
 .vscode/
@@ -113,6 +118,10 @@ __pycache__
 aptos-move/aptos-vm-profiling/**/*.log
 aptos-move/aptos-vm-profiling/**/*.txt
 
+# Gas profiler outputs
+aptos-move/e2e-move-tests/gas-profiling
+gas-profiling
+
 # replay-verify and module-verify script outputs
 metadata-cache
 /local/
@@ -121,3 +130,8 @@ run_*
 # test files for indexer GRPC
 test_indexer_grpc_*.yaml
 test_indexer_grpc/*
+
+# ignore compiler artifacts
+*.dot
+*.bytecode
+!third_party/move/move-prover/tests/xsources/design/*.bytecode

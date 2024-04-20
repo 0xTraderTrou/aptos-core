@@ -36,11 +36,11 @@ impl AggregateSignature {
         }
     }
 
-    pub fn get_voters_bitvec(&self) -> &BitVec {
+    pub fn get_signers_bitvec(&self) -> &BitVec {
         &self.validator_bitmask
     }
 
-    pub fn get_voter_addresses(
+    pub fn get_signers_addresses(
         &self,
         validator_addresses: &[AccountAddress],
     ) -> Vec<AccountAddress> {
@@ -96,5 +96,9 @@ impl PartialSignatures {
 
     pub fn signatures(&self) -> &BTreeMap<AccountAddress, bls12381::Signature> {
         &self.signatures
+    }
+
+    pub fn contains_voter(&self, voter: &AccountAddress) -> bool {
+        self.signatures.contains_key(voter)
     }
 }

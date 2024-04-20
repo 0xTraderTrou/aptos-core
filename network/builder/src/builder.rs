@@ -19,8 +19,7 @@ use aptos_config::{
     },
     network_id::NetworkContext,
 };
-use aptos_crypto::x25519::PublicKey;
-use aptos_event_notifications::{EventSubscriptionService, ReconfigNotificationListener};
+use aptos_event_notifications::{DbBackedOnChainConfig, EventSubscriptionService};
 use aptos_logger::prelude::*;
 use aptos_netcore::transport::tcp::TCPBufferCfg;
 use aptos_network::{
@@ -63,7 +62,7 @@ pub struct NetworkBuilder {
     executor: Option<Handle>,
     time_service: TimeService,
     network_context: NetworkContext,
-    discovery_listeners: Option<Vec<DiscoveryChangeListener>>,
+    discovery_listeners: Option<Vec<DiscoveryChangeListener<DbBackedOnChainConfig>>>,
     connectivity_manager_builder: Option<ConnectivityManagerBuilder>,
     health_checker_builder: Option<HealthCheckerBuilder>,
     peer_manager_builder: PeerManagerBuilder,
@@ -156,6 +155,7 @@ impl NetworkBuilder {
             CONNECTIVITY_CHECK_INTERVAL_MS,
             NETWORK_CHANNEL_SIZE,
             mutual_authentication,
+            true, /* enable_latency_aware_dialing */
         );
 
         builder
@@ -167,12 +167,11 @@ impl NetworkBuilder {
         role: RoleType,
         config: &NetworkConfig,
         time_service: TimeService,
-        mut reconfig_subscription_service: Option<&mut EventSubscriptionService>,
+        reconfig_subscription_service: Option<&mut EventSubscriptionService>,
         peers_and_metadata: Arc<PeersAndMetadata>,
     ) -> NetworkBuilder {
         let peer_id = config.peer_id();
         let identity_key = config.identity_key();
-        let pubkey = identity_key.public_key();
 
         let authentication_mode = if config.mutual_authentication {
             AuthenticationMode::Mutual(identity_key)
@@ -207,6 +206,7 @@ impl NetworkBuilder {
             config.ping_interval_ms,
             config.ping_timeout_ms,
             config.ping_failures_tolerated,
+            config.max_parallel_deserialization_tasks,
         );
 
         // Always add a connectivity manager to keep track of known peers
@@ -221,28 +221,11 @@ impl NetworkBuilder {
             config.connectivity_check_interval_ms,
             config.network_channel_size,
             config.mutual_authentication,
+            config.enable_latency_aware_dialing,
         );
 
         network_builder.discovery_listeners = Some(Vec::new());
-        for discovery_method in config.discovery_methods() {
-            let reconfig_listener = if *discovery_method == DiscoveryMethod::Onchain {
-                Some(
-                    reconfig_subscription_service
-                        .as_mut()
-                        .expect("An event subscription service is required for on-chain discovery!")
-                        .subscribe_to_reconfigurations()
-                        .expect("On-chain discovery is unable to subscribe to reconfigurations!"),
-                )
-            } else {
-                None
-            };
-
-            network_builder.add_discovery_change_listener(
-                discovery_method,
-                pubkey,
-                reconfig_listener,
-            );
-        }
+        network_builder.setup_discovery(config, reconfig_subscription_service);
 
         // Ensure there are no duplicate source types
         let set: HashSet<_> = network_builder
@@ -339,6 +322,7 @@ impl NetworkBuilder {
         connectivity_check_interval_ms: u64,
         channel_size: usize,
         mutual_authentication: bool,
+        enable_latency_aware_dialing: bool,
     ) -> &mut Self {
         let pm_conn_mgr_notifs_rx = self.peer_manager_builder.add_connection_event_listener();
         let outbound_connection_limit = if !self.network_context.network_id().is_validator_network()
@@ -361,52 +345,59 @@ impl NetworkBuilder {
             pm_conn_mgr_notifs_rx,
             outbound_connection_limit,
             mutual_authentication,
+            enable_latency_aware_dialing,
         ));
         self
     }
 
-    fn add_discovery_change_listener(
+    fn setup_discovery(
         &mut self,
-        discovery_method: &DiscoveryMethod,
-        pubkey: PublicKey,
-        reconfig_events: Option<ReconfigNotificationListener>,
+        config: &NetworkConfig,
+        mut reconfig_subscription_service: Option<&mut EventSubscriptionService>,
     ) {
         let conn_mgr_reqs_tx = self
             .conn_mgr_reqs_tx()
             .expect("ConnectivityManager must exist");
-
-        let listener = match discovery_method {
-            DiscoveryMethod::Onchain => {
-                let reconfig_events =
-                    reconfig_events.expect("Reconfiguration listener is expected!");
-                DiscoveryChangeListener::validator_set(
+        for discovery_method in config.discovery_methods() {
+            let listener = match discovery_method {
+                DiscoveryMethod::Onchain => {
+                    let reconfig_events = reconfig_subscription_service
+                        .as_mut()
+                        .expect("An event subscription service is required for on-chain discovery!")
+                        .subscribe_to_reconfigurations()
+                        .expect("On-chain discovery is unable to subscribe to reconfigurations!");
+                    let identity_key = config.identity_key();
+                    let pubkey = identity_key.public_key();
+                    DiscoveryChangeListener::validator_set(
+                        self.network_context,
+                        conn_mgr_reqs_tx.clone(),
+                        pubkey,
+                        reconfig_events,
+                    )
+                },
+                DiscoveryMethod::File(file_discovery) => DiscoveryChangeListener::file(
                     self.network_context,
-                    conn_mgr_reqs_tx,
-                    pubkey,
-                    reconfig_events,
-                )
-            },
-            DiscoveryMethod::File(file_discovery) => DiscoveryChangeListener::file(
-                self.network_context,
-                conn_mgr_reqs_tx,
-                file_discovery.path.as_path(),
-                Duration::from_secs(file_discovery.interval_secs),
-                self.time_service.clone(),
-            ),
-            DiscoveryMethod::Rest(rest_discovery) => DiscoveryChangeListener::rest(
-                self.network_context,
-                conn_mgr_reqs_tx,
-                rest_discovery.url.clone(),
-                Duration::from_secs(rest_discovery.interval_secs),
-                self.time_service.clone(),
-            ),
-            DiscoveryMethod::None => return,
-        };
-
-        self.discovery_listeners
-            .as_mut()
-            .expect("Can only add listeners before starting")
-            .push(listener);
+                    conn_mgr_reqs_tx.clone(),
+                    file_discovery.path.as_path(),
+                    Duration::from_secs(file_discovery.interval_secs),
+                    self.time_service.clone(),
+                ),
+                DiscoveryMethod::Rest(rest_discovery) => DiscoveryChangeListener::rest(
+                    self.network_context,
+                    conn_mgr_reqs_tx.clone(),
+                    rest_discovery.url.clone(),
+                    Duration::from_secs(rest_discovery.interval_secs),
+                    self.time_service.clone(),
+                ),
+                DiscoveryMethod::None => {
+                    continue;
+                },
+            };
+            self.discovery_listeners
+                .as_mut()
+                .expect("Can only add listeners before starting")
+                .push(listener);
+        }
     }
 
     /// Add a HealthChecker to the network.
@@ -415,10 +406,13 @@ impl NetworkBuilder {
         ping_interval_ms: u64,
         ping_timeout_ms: u64,
         ping_failures_tolerated: u64,
+        max_parallel_deserialization_tasks: Option<usize>,
     ) -> &mut Self {
         // Initialize and start HealthChecker.
-        let (hc_network_tx, hc_network_rx) =
-            self.add_client_and_service(&health_checker::health_checker_network_config());
+        let (hc_network_tx, hc_network_rx) = self.add_client_and_service(
+            &health_checker::health_checker_network_config(),
+            max_parallel_deserialization_tasks,
+        );
         self.health_checker_builder = Some(HealthCheckerBuilder::new(
             self.network_context(),
             self.time_service.clone(),
@@ -442,10 +436,14 @@ impl NetworkBuilder {
     pub fn add_client_and_service<SenderT: NewNetworkSender, EventsT: NewNetworkEvents>(
         &mut self,
         config: &NetworkApplicationConfig,
+        max_parallel_deserialization_tasks: Option<usize>,
     ) -> (SenderT, EventsT) {
         (
             self.add_client(&config.network_client_config),
-            self.add_service(&config.network_service_config),
+            self.add_service(
+                &config.network_service_config,
+                max_parallel_deserialization_tasks,
+            ),
         )
     }
 
@@ -459,10 +457,13 @@ impl NetworkBuilder {
     /// Register a new service application with the network. Return the service
     /// interface for handling network requests.
     // TODO(philiphayes): return new NetworkService (name TBD) interface?
-    fn add_service<EventsT: NewNetworkEvents>(&mut self, config: &NetworkServiceConfig) -> EventsT {
-        let (peer_mgr_reqs_rx, connection_notifs_rx) =
-            self.peer_manager_builder.add_service(config);
-        EventsT::new(peer_mgr_reqs_rx, connection_notifs_rx)
+    fn add_service<EventsT: NewNetworkEvents>(
+        &mut self,
+        config: &NetworkServiceConfig,
+        max_parallel_deserialization_tasks: Option<usize>,
+    ) -> EventsT {
+        let peer_mgr_reqs_rx = self.peer_manager_builder.add_service(config);
+        EventsT::new(peer_mgr_reqs_rx, max_parallel_deserialization_tasks)
     }
 }
 
